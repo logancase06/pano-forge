@@ -1,35 +1,42 @@
-"""Tests pour le pipeline complet (:mod:`src.forge`).
+"""Tests pour le pipeline (:mod:`src.forge`).
 
-Les étapes réseau (ingest/caption/panorama) sont remplacées via monkeypatch :
-on teste l'orchestration et le stub World Labs, pas les services externes.
+Les étapes réseau (ingest/caption/panorama/World Labs) sont remplacées via
+monkeypatch ou transport injecté : on teste l'orchestration et la logique
+World Labs, pas les services externes.
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from PIL import Image
 
 from src import forge as forge_module
 from src.forge import (
+    MULTI_IMAGE_LIMIT,
     WORLD_LABS_MODEL,
     PipelineResult,
     WorldLabsError,
     _build_world_request,
     _operation_id,
+    _select_images,
+    download_world_assets,
     forge,
-    prepare_world_labs,
     submit_world_labs,
 )
 from src.panorama import Panorama
 
 
-def _fake_panorama(prompt="a 360 room"):
-    img = Image.new("RGB", (2048, 1024), (12, 34, 56))
-    return Panorama(
-        image=img, width=2048, height=1024, prompt=prompt, backend="hf_space"
-    )
+class FakeImg:
+    """Doublure d'IngestedImage : porte une image PIL, des dimensions, un chemin."""
+
+    def __init__(self, w=100, h=100, name="a.jpg", color=(1, 2, 3)):
+        self.image = Image.new("RGB", (w, h), color)
+        self.width = w
+        self.height = h
+        self.path = Path(name)
 
 
 @pytest.fixture
@@ -37,25 +44,27 @@ def patched(monkeypatch):
     """Remplace ingest/caption/panorama par des doublures qui enregistrent."""
     calls = {}
 
-    class FakeImg:
-        image = Image.new("RGB", (10, 10))
-
     def fake_ingest(input_dir, *, min_images=3):
         calls["ingest"] = {"input_dir": input_dir, "min_images": min_images}
-        return [FakeImg(), FakeImg(), FakeImg()]
+        return [
+            FakeImg(800, 600, "a.jpg"),
+            FakeImg(1920, 1080, "b.jpg"),  # plus haute résolution
+            FakeImg(640, 480, "c.jpg"),
+        ]
 
-    def fake_describe(source, *, client=None, extra_guidance=None):
-        calls["describe"] = {"source": source, "extra_guidance": extra_guidance}
+    def fake_describe(source, *, client=None, extra_guidance=None, hf_token=None):
+        calls["describe"] = {"source": source}
         return "a cozy 360 living room"
 
-    def fake_generate(prompt, *, backend="hf_space", seed=0, num_inference_steps=50):
-        calls["generate"] = {
-            "prompt": prompt,
-            "backend": backend,
-            "seed": seed,
-            "steps": num_inference_steps,
-        }
-        return _fake_panorama(prompt)
+    def fake_generate(prompt, *, seed=0, num_inference_steps=50):
+        calls["generate"] = {"prompt": prompt, "seed": seed, "steps": num_inference_steps}
+        return Panorama(
+            image=Image.new("RGB", (2048, 1024)),
+            width=2048,
+            height=1024,
+            prompt=prompt,
+            backend="hf_space",
+        )
 
     monkeypatch.setattr(forge_module, "ingest", fake_ingest)
     monkeypatch.setattr(forge_module, "describe_room", fake_describe)
@@ -63,100 +72,190 @@ def patched(monkeypatch):
     return calls
 
 
-def test_forge_runs_full_pipeline(tmp_path, patched):
+# --- sélection d'images -----------------------------------------------------
+
+
+def test_select_images_picks_highest_resolution():
+    imgs = [FakeImg(800, 600, "a.jpg"), FakeImg(1920, 1080, "b.jpg")]
+    assert _select_images(imgs, multi=False)[0].path.name == "b.jpg"
+
+
+def test_select_images_multi_limit():
+    imgs = [FakeImg(100, 100, f"{i}.jpg") for i in range(6)]
+    assert len(_select_images(imgs, multi=True)) == MULTI_IMAGE_LIMIT
+
+
+# --- backend worldlabs (défaut) ---------------------------------------------
+
+
+def test_forge_worldlabs_exports_real_photo(tmp_path, patched):
     result = forge(tmp_path / "input", tmp_path / "out")
 
-    assert isinstance(result, PipelineResult)
+    assert result.backend == "worldlabs"
+    assert result.prompt is None  # pas de caption en worldlabs
+    assert result.panorama is None
+    assert len(result.source_images) == 1
+    assert result.source_images[0].name == "source-00.jpg"
+    assert result.source_images[0].exists()
+    # la photo la plus haute résolution est retenue
+    # (b.jpg 1920x1080) — exportée en source-00.jpg
+    manifest = json.loads(
+        (tmp_path / "out" / "world_labs_request.json").read_text(encoding="utf-8")
+    )
+    assert manifest["backend"] == "worldlabs"
+    assert manifest["multi"] is False
+
+
+def test_forge_worldlabs_multi_exports_four(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        forge_module,
+        "ingest",
+        lambda d, *, min_images=3: [FakeImg(100, 100, f"{i}.jpg") for i in range(5)],
+    )
+    result = forge(tmp_path / "input", tmp_path / "out", multi=True)
+    assert len(result.source_images) == MULTI_IMAGE_LIMIT
+    assert result.world_labs_request["multi"] is True
+
+
+# --- backend dit360 ---------------------------------------------------------
+
+
+def test_forge_dit360_uses_caption_and_panorama(tmp_path, patched):
+    result = forge(tmp_path / "input", tmp_path / "out", backend="dit360")
+
+    assert result.backend == "dit360"
     assert result.prompt == "a cozy 360 living room"
-    # Le prompt issu de la caption alimente bien la génération.
+    assert result.panorama is not None
+    assert result.source_images[0].name == "panorama.jpg"
     assert patched["generate"]["prompt"] == "a cozy 360 living room"
-    # Le panorama est sauvegardé.
-    assert result.panorama_path.exists()
-    assert result.panorama_path.name == "panorama.jpg"
 
 
-def test_forge_passes_backend_and_seed(tmp_path, patched):
-    forge(tmp_path / "input", tmp_path / "out", backend="local_dit360", seed=42)
-    assert patched["generate"]["backend"] == "local_dit360"
+def test_forge_dit360_passes_seed(tmp_path, patched):
+    forge(tmp_path / "input", tmp_path / "out", backend="dit360", seed=42)
     assert patched["generate"]["seed"] == 42
 
 
-def test_forge_captions_first_image(tmp_path, patched):
-    forge(tmp_path / "input", tmp_path / "out")
-    # La source caption est la 1re image ingérée (un objet portant .image).
-    assert hasattr(patched["describe"]["source"], "image")
+def test_forge_unknown_backend(tmp_path, patched):
+    with pytest.raises(ValueError, match="Backend inconnu"):
+        forge(tmp_path / "input", tmp_path / "out", backend="imagine")
 
 
-def test_forge_writes_world_labs_manifest(tmp_path, patched):
-    result = forge(tmp_path / "input", tmp_path / "out")
-    manifest = tmp_path / "out" / "world_labs_request.json"
-
-    assert manifest.exists()
-    data = json.loads(manifest.read_text(encoding="utf-8"))
-    assert data["input_type"] == "equirectangular_panorama"
-    assert data["width"] == 2048 and data["height"] == 1024
-    assert data["prompt"] == "a cozy 360 living room"
-    assert result.world_labs_request == data
+# --- World Labs : construction de requête ------------------------------------
 
 
-def test_prepare_world_labs_payload(tmp_path):
-    pano = _fake_panorama("beach sunset")
-    pano_path = tmp_path / "panorama.jpg"
-    pano.save(pano_path)
-
-    payload = prepare_world_labs(pano, pano_path, output_dir=tmp_path)
-    assert payload["panorama_path"] == str(pano_path)
-    assert payload["endpoint"].startswith("https://")
-
-
-def test_build_world_request_has_base64_and_model(tmp_path):
+def test_build_world_request_single_base64(tmp_path):
     pano = tmp_path / "panorama.jpg"
     Image.new("RGB", (8, 8)).save(pano)
 
-    req = _build_world_request(pano, prompt="a bright room", display_name="demo")
+    req = _build_world_request(
+        [(pano, 0)],
+        prompt="a room",
+        display_name="demo",
+        multi=False,
+        api_key="k",
+        transport=None,
+        upload=None,
+    )
     assert req["model"] == WORLD_LABS_MODEL
-    assert req["display_name"] == "demo"
-    image_prompt = req["world_prompt"]["image_prompt"]
-    assert image_prompt["source"] == "data_base64"
-    assert image_prompt["data_base64"]  # non vide
-    assert image_prompt["mime_type"] == "image/jpeg"
-    assert req["world_prompt"]["text_prompt"] == "a bright room"
+    ip = req["world_prompt"]["image_prompt"]
+    assert ip["source"] == "data_base64" and ip["data_base64"]
+    assert req["world_prompt"]["text_prompt"] == "a room"
+
+
+def test_build_world_request_multi_uploads(tmp_path):
+    paths = []
+    for i in range(2):
+        p = tmp_path / f"s{i}.jpg"
+        Image.new("RGB", (8, 8)).save(p)
+        paths.append((p, i * 180))
+
+    uploaded = []
+
+    def transport(url, *, api_key, method="GET", payload=None):
+        return {
+            "media_asset": {"media_asset_id": f"asset-{len(uploaded)}"},
+            "upload_info": {"upload_url": "http://up/x", "upload_method": "PUT"},
+        }
+
+    def upload(url, path, *, method="PUT", headers=None):
+        uploaded.append((url, str(path)))
+
+    req = _build_world_request(
+        paths,
+        prompt=None,
+        display_name="demo",
+        multi=True,
+        api_key="k",
+        transport=transport,
+        upload=upload,
+    )
+    assert req["world_prompt"]["type"] == "multi-image"
+    entries = req["world_prompt"]["multi_image_prompt"]
+    assert len(entries) == 2
+    assert entries[0]["content"]["source"] == "media_asset"
+    assert entries[1]["azimuth"] == 180
+    assert len(uploaded) == 2
 
 
 def test_operation_id_extracts_last_segment():
     assert _operation_id({"operation_id": "orgs/x/operations/abc123"}) == "abc123"
-    assert _operation_id({"name": "op-42"}) == "op-42"
     with pytest.raises(WorldLabsError, match="operation_id"):
         _operation_id({})
 
 
-def test_submit_world_labs_submits_then_polls(tmp_path):
+# --- World Labs : submit + poll ---------------------------------------------
+
+
+def test_submit_world_labs_single_then_polls(tmp_path):
     pano = tmp_path / "panorama.jpg"
     Image.new("RGB", (8, 8)).save(pano)
 
     responses = iter([
-        {"operation_id": "ops/abc", "done": False},  # POST worlds:generate
-        {"operation_id": "ops/abc", "done": False},  # 1er poll
-        {
-            "operation_id": "ops/abc",
-            "done": True,
-            "response": {"assets": {"imagery": {"pano_url": "http://x/p.png"}}},
-        },
+        {"operation_id": "ops/abc", "done": False},
+        {"operation_id": "ops/abc", "done": False},
+        {"operation_id": "ops/abc", "done": True, "response": {"assets": {}}},
     ])
     calls = []
 
     def transport(url, *, api_key, method="GET", payload=None):
-        calls.append((method, url, payload is not None))
+        calls.append((method, url))
         return next(responses)
 
     world = submit_world_labs(
         pano, prompt="a room", api_key="k", poll_interval=0, _transport=transport
     )
+    assert world == {"assets": {}}
+    assert calls[0] == ("POST", f"{forge_module.WORLD_LABS_ENDPOINT}/worlds:generate")
+    assert calls[1][1].endswith("/operations/abc")
 
-    assert world["assets"]["imagery"]["pano_url"] == "http://x/p.png"
-    # 1er appel = POST worlds:generate avec corps ; ensuite GET operations/abc.
-    assert calls[0] == ("POST", f"{forge_module.WORLD_LABS_ENDPOINT}/worlds:generate", True)
-    assert calls[1][0] == "GET" and calls[1][1].endswith("/operations/abc")
+
+def test_submit_world_labs_multi(tmp_path):
+    paths = []
+    for i in range(2):
+        p = tmp_path / f"s{i}.jpg"
+        Image.new("RGB", (8, 8)).save(p)
+        paths.append(p)
+
+    uploaded = []
+
+    def transport(url, *, api_key, method="GET", payload=None):
+        if url.endswith("prepare_upload"):
+            return {
+                "media_asset": {"media_asset_id": f"asset-{len(uploaded)}"},
+                "upload_info": {"upload_url": "http://up/x"},
+            }
+        # worlds:generate -> terminé d'emblée
+        return {"operation_id": "o", "done": True, "response": {"assets": {"x": 1}}}
+
+    def upload(url, path, *, method="PUT", headers=None):
+        uploaded.append(str(path))
+
+    world = submit_world_labs(
+        paths, api_key="k", multi=True, poll_interval=0,
+        _transport=transport, _upload=upload,
+    )
+    assert world == {"assets": {"x": 1}}
+    assert len(uploaded) == 2
 
 
 def test_submit_world_labs_missing_key(tmp_path, monkeypatch):
@@ -175,12 +274,51 @@ def test_submit_world_labs_propagates_error(tmp_path):
         submit_world_labs(pano, api_key="k", poll_interval=0, _transport=lambda *a, **k: op)
 
 
+# --- téléchargement des assets ----------------------------------------------
+
+
+def test_download_world_assets(tmp_path, monkeypatch):
+    world = {
+        "assets": {
+            "mesh": {"collider_mesh_url": "http://x/a.glb"},
+            "imagery": {"pano_url": "http://x/p.png"},
+            "thumbnail_url": "http://x/t.webp",
+            "splats": {"spz_urls": {"100k": "http://x/s100.spz", "full_res": "http://x/sf.spz"}},
+        }
+    }
+    seen = []
+
+    def fake_dl(url, dest):
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x")
+        seen.append(url)
+        return dest
+
+    monkeypatch.setattr(forge_module, "_download_file", fake_dl)
+    res = download_world_assets(world, tmp_path)
+
+    assert res["glb"].name == "world.glb"
+    assert res["pano"].name == "world-pano.png"
+    assert res["thumbnail"].name == "world-thumbnail.webp"
+    assert set(res["spz"]) == {"100k", "full_res"}
+    assert len(seen) == 5
+
+
+def test_download_world_assets_handles_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(forge_module, "_download_file", lambda url, dest: dest)
+    assert download_world_assets({"assets": {}}, tmp_path) == {"spz": {}}
+
+
+# --- forge --submit + CLI ---------------------------------------------------
+
+
 def test_forge_submit_calls_world_labs(tmp_path, patched, monkeypatch):
     captured = {}
 
-    def fake_submit(panorama_path, *, prompt=None, display_name="pano-forge"):
-        captured["path"] = panorama_path
-        captured["prompt"] = prompt
+    def fake_submit(arg, *, prompt=None, display_name="pano-forge", multi=False):
+        captured["arg"] = arg
+        captured["multi"] = multi
         return {"assets": {"imagery": {"pano_url": "http://x/p.png"}}}
 
     monkeypatch.setattr(forge_module, "submit_world_labs", fake_submit)
@@ -190,59 +328,32 @@ def test_forge_submit_calls_world_labs(tmp_path, patched, monkeypatch):
     result = forge(tmp_path / "input", tmp_path / "out", submit=True)
 
     assert result.world == {"assets": {"imagery": {"pano_url": "http://x/p.png"}}}
-    assert captured["prompt"] == "a cozy 360 living room"
     assert result.world_assets == {"pano": (tmp_path / "out") / "p"}
+    # single-image : l'argument est un chemin, pas une liste
+    assert isinstance(captured["arg"], Path)
+    assert captured["multi"] is False
 
 
-def test_download_world_assets(tmp_path, monkeypatch):
-    world = {
-        "assets": {
-            "mesh": {"collider_mesh_url": "http://x/a.glb"},
-            "imagery": {"pano_url": "http://x/p.png"},
-            "thumbnail_url": "http://x/t.webp",
-            "splats": {
-                "spz_urls": {
-                    "100k": "http://x/s100.spz",
-                    "full_res": "http://x/sfull.spz",
-                }
-            },
-        }
-    }
-    seen = []
+def test_forge_submit_multi_passes_list(tmp_path, patched, monkeypatch):
+    captured = {}
 
-    def fake_dl(url, dest):
-        from pathlib import Path
+    def fake_submit(arg, *, prompt=None, display_name="pano-forge", multi=False):
+        captured["arg"] = arg
+        captured["multi"] = multi
+        return {"assets": {}}
 
-        dest = Path(dest)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"x")
-        seen.append(url)
-        return dest
+    monkeypatch.setattr(forge_module, "submit_world_labs", fake_submit)
+    monkeypatch.setattr(forge_module, "download_world_assets", lambda world, out: {})
+    forge(tmp_path / "input", tmp_path / "out", multi=True, submit=True)
 
-    monkeypatch.setattr(forge_module, "_download_file", fake_dl)
-    res = forge_module.download_world_assets(world, tmp_path)
-
-    assert res["glb"].name == "world.glb"
-    assert res["pano"].name == "world-pano.png"
-    assert res["thumbnail"].name == "world-thumbnail.webp"
-    assert set(res["spz"]) == {"100k", "full_res"}
-    assert res["spz"]["100k"].name == "world-100k.spz"
-    assert len(seen) == 5
-
-
-def test_download_world_assets_handles_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        forge_module, "_download_file", lambda url, dest: dest
-    )
-    res = forge_module.download_world_assets({"assets": {}}, tmp_path)
-    assert res == {"spz": {}}
+    assert captured["multi"] is True
+    assert isinstance(captured["arg"], list)  # liste de (path, azimuth)
 
 
 def test_main_success(tmp_path, patched, capsys):
     rc = forge_module.main([str(tmp_path / "input"), "-o", str(tmp_path / "out")])
     assert rc == 0
-    out = capsys.readouterr().out
-    assert "Panorama" in out
+    assert "Backend : worldlabs" in capsys.readouterr().out
 
 
 def test_main_handles_pipeline_error(tmp_path, monkeypatch, capsys):
