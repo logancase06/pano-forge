@@ -13,7 +13,11 @@ from PIL import Image
 
 from src import forge as forge_module
 from src.forge import (
+    WORLD_LABS_MODEL,
     PipelineResult,
+    WorldLabsError,
+    _build_world_request,
+    _operation_id,
     forge,
     prepare_world_labs,
     submit_world_labs,
@@ -105,9 +109,85 @@ def test_prepare_world_labs_payload(tmp_path):
     assert payload["endpoint"].startswith("https://")
 
 
-def test_submit_world_labs_not_implemented():
-    with pytest.raises(NotImplementedError):
-        submit_world_labs({"endpoint": "x"})
+def test_build_world_request_has_base64_and_model(tmp_path):
+    pano = tmp_path / "panorama.jpg"
+    Image.new("RGB", (8, 8)).save(pano)
+
+    req = _build_world_request(pano, prompt="a bright room", display_name="demo")
+    assert req["model"] == WORLD_LABS_MODEL
+    assert req["display_name"] == "demo"
+    image_prompt = req["world_prompt"]["image_prompt"]
+    assert image_prompt["source"] == "data_base64"
+    assert image_prompt["data_base64"]  # non vide
+    assert image_prompt["mime_type"] == "image/jpeg"
+    assert req["world_prompt"]["text_prompt"] == "a bright room"
+
+
+def test_operation_id_extracts_last_segment():
+    assert _operation_id({"operation_id": "orgs/x/operations/abc123"}) == "abc123"
+    assert _operation_id({"name": "op-42"}) == "op-42"
+    with pytest.raises(WorldLabsError, match="operation_id"):
+        _operation_id({})
+
+
+def test_submit_world_labs_submits_then_polls(tmp_path):
+    pano = tmp_path / "panorama.jpg"
+    Image.new("RGB", (8, 8)).save(pano)
+
+    responses = iter([
+        {"operation_id": "ops/abc", "done": False},  # POST worlds:generate
+        {"operation_id": "ops/abc", "done": False},  # 1er poll
+        {
+            "operation_id": "ops/abc",
+            "done": True,
+            "response": {"assets": {"imagery": {"pano_url": "http://x/p.png"}}},
+        },
+    ])
+    calls = []
+
+    def transport(url, *, api_key, method="GET", payload=None):
+        calls.append((method, url, payload is not None))
+        return next(responses)
+
+    world = submit_world_labs(
+        pano, prompt="a room", api_key="k", poll_interval=0, _transport=transport
+    )
+
+    assert world["assets"]["imagery"]["pano_url"] == "http://x/p.png"
+    # 1er appel = POST worlds:generate avec corps ; ensuite GET operations/abc.
+    assert calls[0] == ("POST", f"{forge_module.WORLD_LABS_ENDPOINT}/worlds:generate", True)
+    assert calls[1][0] == "GET" and calls[1][1].endswith("/operations/abc")
+
+
+def test_submit_world_labs_missing_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORLD_LABS_API_KEY", raising=False)
+    pano = tmp_path / "panorama.jpg"
+    Image.new("RGB", (8, 8)).save(pano)
+    with pytest.raises(WorldLabsError, match="WORLD_LABS_API_KEY"):
+        submit_world_labs(pano, api_key=None, _transport=lambda *a, **k: {})
+
+
+def test_submit_world_labs_propagates_error(tmp_path):
+    pano = tmp_path / "panorama.jpg"
+    Image.new("RGB", (8, 8)).save(pano)
+    op = {"operation_id": "o", "done": True, "error": "bad input"}
+    with pytest.raises(WorldLabsError, match="échou"):
+        submit_world_labs(pano, api_key="k", poll_interval=0, _transport=lambda *a, **k: op)
+
+
+def test_forge_submit_calls_world_labs(tmp_path, patched, monkeypatch):
+    captured = {}
+
+    def fake_submit(panorama_path, *, prompt=None, display_name="pano-forge"):
+        captured["path"] = panorama_path
+        captured["prompt"] = prompt
+        return {"assets": {"imagery": {"pano_url": "http://x/p.png"}}}
+
+    monkeypatch.setattr(forge_module, "submit_world_labs", fake_submit)
+    result = forge(tmp_path / "input", tmp_path / "out", submit=True)
+
+    assert result.world == {"assets": {"imagery": {"pano_url": "http://x/p.png"}}}
+    assert captured["prompt"] == "a cozy 360 living room"
 
 
 def test_main_success(tmp_path, patched, capsys):
