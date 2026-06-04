@@ -308,6 +308,96 @@ def test_forge_video_missing_file(tmp_path):
         forge(tmp_path / "input", tmp_path / "out", video=tmp_path / "nope.mp4")
 
 
+# --- mode mix : MP4 combiné (vidéo + photos en frames fixes) -> World Labs vidéo --
+
+
+def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"x")
+    captured = {}
+
+    def fake_ingest(input_dir, *, min_images=3):
+        return [FakeImg(100, 100, "p1.jpg"), FakeImg(100, 100, "p2.jpg")]
+
+    def fake_build(video_path, photos, dest, *, still_seconds=2.5):
+        captured["photos"] = len(photos)
+        captured["still"] = still_seconds
+        Path(dest).write_bytes(b"mp4")
+        return Path(dest)
+
+    def fake_submit(images=None, *, video=None, prompt=None, display_name="pano-forge", multi=False):
+        captured["video"] = video
+        captured["multi"] = multi
+        return {"assets": {}}
+
+    monkeypatch.setattr(forge_module, "ingest", fake_ingest)
+    monkeypatch.setattr(forge_module, "_build_mix_video", fake_build)
+    monkeypatch.setattr(forge_module, "submit_world_labs", fake_submit)
+    monkeypatch.setattr(forge_module, "download_world_assets", lambda w, o: {})
+
+    result = forge(
+        tmp_path / "input", tmp_path / "out",
+        mix=True, video=vid, still_seconds=3.0, submit=True,
+    )
+
+    assert result.backend == "mix"
+    # un seul MP4 combiné, envoyé en VIDÉO (pas multi-image)
+    assert result.source_images == [result.run_dir / "mixed.mp4"]
+    assert captured["video"] == result.run_dir / "mixed.mp4"
+    assert "multi" not in captured or captured["multi"] is False
+    assert captured["photos"] == 2  # les 2 photos ajoutées
+    assert captured["still"] == 3.0
+    assert result.world_labs_request["backend"] == "mix"
+    assert result.world_labs_request["photos"] == 2
+    assert result.world_labs_request["still_seconds"] == 3.0
+
+
+def test_forge_mix_requires_video(tmp_path):
+    with pytest.raises(ValueError, match="--mix nécessite --video"):
+        forge(tmp_path / "input", tmp_path / "out", mix=True)
+
+
+def test_forge_mix_tolerates_no_photos(tmp_path, monkeypatch):
+    from src.ingest import IngestError
+
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"x")
+    captured = {}
+
+    def boom_ingest(*a, **k):
+        raise IngestError("aucune photo")
+
+    def fake_build(video_path, photos, dest, *, still_seconds=2.5):
+        captured["photos"] = len(photos)
+        Path(dest).write_bytes(b"mp4")
+        return Path(dest)
+
+    monkeypatch.setattr(forge_module, "ingest", boom_ingest)
+    monkeypatch.setattr(forge_module, "_build_mix_video", fake_build)
+
+    result = forge(tmp_path / "input", tmp_path / "out", mix=True, video=vid)
+    assert result.backend == "mix"
+    assert captured["photos"] == 0  # aucune photo -> juste la vidéo
+
+
+def test_build_mix_video_appends_stills(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    src = tmp_path / "src.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(src), fourcc, 10.0, (32, 32))
+    if not writer.isOpened():
+        pytest.skip("encodeur mp4v indisponible")
+    for _ in range(5):
+        writer.write(np.zeros((32, 32, 3), dtype=np.uint8))
+    writer.release()
+
+    photos = [Image.new("RGB", (20, 16), (255, 0, 0))]
+    out = forge_module._build_mix_video(src, photos, tmp_path / "mixed.mp4", still_seconds=0.5)
+    assert out.exists() and out.stat().st_size > 0
+
+
 def test_operation_id_extracts_last_segment():
     assert _operation_id({"operation_id": "orgs/x/operations/abc123"}) == "abc123"
     with pytest.raises(WorldLabsError, match="operation_id"):

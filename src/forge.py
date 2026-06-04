@@ -172,6 +172,76 @@ def _even_azimuth(index: int, count: int) -> int:
     return round(index * 360 / count) if count else 0
 
 
+def _letterbox_bgr(pil_image: Image.Image, width: int, height: int) -> np.ndarray:
+    """Redimensionne une image PIL dans un canvas WxH (letterbox), en BGR pour cv2."""
+    img = pil_image if pil_image.mode == "RGB" else pil_image.convert("RGB")
+    scale = min(width / img.width, height / img.height)
+    nw, nh = max(1, round(img.width * scale)), max(1, round(img.height * scale))
+    resized = np.asarray(img.resize((nw, nh), Image.LANCZOS))  # RGB
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)  # bandes noires
+    x, y = (width - nw) // 2, (height - nh) // 2
+    canvas[y : y + nh, x : x + nw] = resized
+    return canvas[:, :, ::-1].copy()  # RGB -> BGR, contigu
+
+
+def _build_mix_video(
+    video_path: str | Path,
+    photos: list[Image.Image],
+    dest: str | Path,
+    *,
+    still_seconds: float = 2.5,
+) -> Path:
+    """Assemble un MP4 : vidéo originale + chaque photo en frame fixe.
+
+    Chaque photo est tenue ~``still_seconds`` secondes (letterbox au format de la
+    vidéo). Import paresseux d'``cv2`` (requis seulement pour ``--mix``).
+    """
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - dépend de l'install
+        raise WorldLabsError(
+            "opencv-python est requis pour --mix. "
+            "Installe-le : pip install opencv-python-headless"
+        ) from exc
+
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if fps <= 0:
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise WorldLabsError(f"Vidéo illisible : {video_path}")
+
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(dest), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise WorldLabsError("Impossible d'initialiser l'encodeur MP4 (codec mp4v).")
+
+    try:
+        # 1) recopie la vidéo originale image par image
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(frame)
+        # 2) ajoute chaque photo comme frame fixe pendant ~still_seconds
+        hold = max(1, round(still_seconds * fps))
+        for photo in photos:
+            bgr = _letterbox_bgr(photo, width, height)
+            for _ in range(hold):
+                writer.write(bgr)
+    finally:
+        writer.release()
+        cap.release()
+
+    return dest
+
+
 # ---------------------------------------------------------------------------
 # Appels HTTP World Labs
 # ---------------------------------------------------------------------------
@@ -525,6 +595,8 @@ def forge(
     backend: str = DEFAULT_BACKEND,
     multi: bool = False,
     video: str | Path | None = None,
+    mix: bool = False,
+    still_seconds: float = 2.5,
     seed: int = DEFAULT_SEED,
     num_inference_steps: int = DEFAULT_STEPS,
     min_images: int = MIN_IMAGES,
@@ -555,9 +627,63 @@ def forge(
         extra_guidance: consignes de style pour la caption (backend dit360).
         hf_token: token HF optionnel pour la caption (backend dit360).
         run_id: nom du sous-dossier de run (par défaut : horodatage).
+        mix: assemble un MP4 combiné (vidéo ``video`` + chaque photo de
+            ``input_dir`` en frame fixe ~``still_seconds`` s) et l'envoie à
+            World Labs en mode vidéo (aucune limite de 4 images).
+        still_seconds: durée d'affichage de chaque photo dans le MP4 mix.
     """
     out = Path(output_dir) / (run_id or _run_id())
     out.mkdir(parents=True, exist_ok=True)
+
+    # --- mode mix : MP4 combiné (vidéo + photos en frames fixes) -> World Labs vidéo ---
+    if mix:
+        if video is None:
+            raise ValueError("--mix nécessite --video.")
+        video_path = Path(video)
+        if not video_path.exists():
+            raise WorldLabsError(f"Vidéo introuvable : {video_path}")
+
+        try:
+            photos = list(ingest(input_dir, min_images=1))
+        except IngestError:
+            photos = []  # mix tolère l'absence de photos (vidéo seule)
+        photo_images = [im.image for im in photos]
+
+        mixed_path = _build_mix_video(
+            video_path, photo_images, out / "mixed.mp4", still_seconds=still_seconds
+        )
+
+        manifest = {
+            "endpoint": WORLD_LABS_ENDPOINT,
+            "model": WORLD_LABS_MODEL,
+            "backend": "mix",
+            "video": str(video_path),
+            "photos": len(photo_images),
+            "still_seconds": still_seconds,
+            "mixed_video": str(mixed_path),
+            "prompt": None,
+        }
+        (out / "world_labs_request.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+
+        world = None
+        world_assets = None
+        if submit:
+            world = submit_world_labs(
+                video=mixed_path, display_name=out.name or "pano-forge"
+            )
+            world_assets = download_world_assets(world, out)
+        return PipelineResult(
+            backend="mix",
+            source_images=[mixed_path],
+            run_dir=out,
+            prompt=None,
+            panorama=None,
+            world_labs_request=manifest,
+            world=world,
+            world_assets=world_assets,
+        )
 
     # --- entrée vidéo : court-circuite ingest/photos ---
     if video is not None:
@@ -696,6 +822,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Chemin d'une vidéo à envoyer à World Labs (type video, prioritaire sur les photos).",
     )
     parser.add_argument(
+        "--mix",
+        action="store_true",
+        help="Assemble un MP4 (--video + photos de input/ en frames fixes) et l'envoie à World Labs en vidéo.",
+    )
+    parser.add_argument(
+        "--still-seconds",
+        dest="still_seconds",
+        type=float,
+        default=2.5,
+        help="Durée d'affichage de chaque photo dans le MP4 mix (par défaut : 2.5 s).",
+    )
+    parser.add_argument(
         "-s",
         "--seed",
         type=int,
@@ -741,6 +879,8 @@ def main(argv: list[str] | None = None) -> int:
             backend=args.backend,
             multi=args.multi,
             video=args.video,
+            mix=args.mix,
+            still_seconds=args.still_seconds,
             seed=args.seed,
             num_inference_steps=args.num_inference_steps,
             min_images=args.min_images,
