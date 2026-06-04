@@ -113,10 +113,11 @@ def test_forge_worldlabs_exports_real_photo(tmp_path, patched):
     assert len(result.source_images) == 1
     assert result.source_images[0].name == "source-00.jpg"
     assert result.source_images[0].exists()
-    # la photo la plus haute résolution est retenue
-    # (b.jpg 1920x1080) — exportée en source-00.jpg
+    # chaque run écrit dans un sous-dossier dédié output/<run>/
+    assert result.run_dir.parent == tmp_path / "out"
+    assert result.source_images[0].parent == result.run_dir
     manifest = json.loads(
-        (tmp_path / "out" / "world_labs_request.json").read_text(encoding="utf-8")
+        (result.run_dir / "world_labs_request.json").read_text(encoding="utf-8")
     )
     assert manifest["backend"] == "worldlabs"
     assert manifest["multi"] is False
@@ -134,6 +135,12 @@ def test_forge_worldlabs_multi_exports_four(tmp_path, monkeypatch):
 
 
 # --- backend dit360 ---------------------------------------------------------
+
+
+def test_forge_run_id_subdir(tmp_path, patched):
+    result = forge(tmp_path / "input", tmp_path / "out", run_id="run-A")
+    assert result.run_dir == tmp_path / "out" / "run-A"
+    assert (tmp_path / "out" / "run-A" / "world_labs_request.json").exists()
 
 
 def test_forge_dit360_uses_caption_and_panorama(tmp_path, patched):
@@ -291,7 +298,7 @@ def test_forge_video_skips_ingest(tmp_path, monkeypatch):
     assert result.source_images == [vid]
     assert captured["video"] == vid
     manifest = json.loads(
-        (tmp_path / "out" / "world_labs_request.json").read_text(encoding="utf-8")
+        (result.run_dir / "world_labs_request.json").read_text(encoding="utf-8")
     )
     assert manifest["backend"] == "video"
 
@@ -432,7 +439,7 @@ def test_forge_submit_calls_world_labs(tmp_path, patched, monkeypatch):
     result = forge(tmp_path / "input", tmp_path / "out", submit=True)
 
     assert result.world == {"assets": {"imagery": {"pano_url": "http://x/p.png"}}}
-    assert result.world_assets == {"pano": (tmp_path / "out") / "p"}
+    assert result.world_assets == {"pano": result.run_dir / "p"}
     # single-image : l'argument est un chemin, pas une liste
     assert isinstance(captured["arg"], Path)
     assert captured["multi"] is False

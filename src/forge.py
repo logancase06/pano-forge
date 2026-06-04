@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -76,6 +77,7 @@ class PipelineResult:
 
     backend: str
     source_images: list[Path]
+    run_dir: Path | None = None  # sous-dossier dédié du run (output/<timestamp>/)
     prompt: str | None = None
     panorama: Panorama | None = None
     world_labs_request: dict = field(default_factory=dict)
@@ -511,6 +513,11 @@ def download_world_assets(
 # ---------------------------------------------------------------------------
 
 
+def _run_id() -> str:
+    """Identifiant de run horodaté (un sous-dossier propre par génération)."""
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
 def forge(
     input_dir: str | Path,
     output_dir: str | Path = "output",
@@ -525,12 +532,16 @@ def forge(
     client=None,
     extra_guidance: str | None = None,
     hf_token: str | None = None,
+    run_id: str | None = None,
 ) -> PipelineResult:
     """Exécute le pipeline depuis un dossier de photos (ou une vidéo).
 
+    Chaque run écrit dans un **sous-dossier dédié** ``output_dir/<run_id>/``
+    (horodaté par défaut), pour garder les générations isolées et comparables.
+
     Args:
         input_dir: dossier des photos sources (ignoré si ``video``).
-        output_dir: dossier de sortie.
+        output_dir: dossier parent ; le run écrit dans ``output_dir/<run_id>/``.
         backend: ``"worldlabs"`` (défaut, photo réelle → World Labs) ou
             ``"dit360"`` (caption → panorama DiT360 → World Labs).
         multi: en backend worldlabs, envoie jusqu'à 4 photos en multi-image.
@@ -543,8 +554,9 @@ def forge(
         client: client gradio injectable (caption, backend dit360).
         extra_guidance: consignes de style pour la caption (backend dit360).
         hf_token: token HF optionnel pour la caption (backend dit360).
+        run_id: nom du sous-dossier de run (par défaut : horodatage).
     """
-    out = Path(output_dir)
+    out = Path(output_dir) / (run_id or _run_id())
     out.mkdir(parents=True, exist_ok=True)
 
     # --- entrée vidéo : court-circuite ingest/photos ---
@@ -572,6 +584,7 @@ def forge(
         return PipelineResult(
             backend="video",
             source_images=[video_path],
+            run_dir=out,
             prompt=None,
             panorama=None,
             world_labs_request=manifest,
@@ -638,6 +651,7 @@ def forge(
     return PipelineResult(
         backend=backend,
         source_images=source_images,
+        run_dir=out,
         prompt=prompt,
         panorama=panorama,
         world_labs_request=manifest,
@@ -737,6 +751,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"[forge] Backend : {result.backend}")
+    print(f"[forge] Dossier du run : {result.run_dir}")
     for path in result.source_images:
         print(f"[forge] Source : {path}")
     if result.prompt:
