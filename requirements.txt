@@ -6,5 +6,14 @@ Pillow>=10.2.0
 # Numerical / array ops (used by panorama stitching & forge stages)
 numpy>=1.26.0
 
+# Panorama generation via the hosted DiT360 Gradio Space (free, no GPU)
+gradio_client>=1.3.0
+
+# Local DiT360 backend (optional, GPU/CUDA) — uncomment to run the model locally
+# diffusers>=0.30.0
+# torch>=2.2.0
+# transformers>=4.44.0
+# accelerate>=0.33.0
+
 # Tests
 pytest>=8.0.0
