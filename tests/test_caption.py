@@ -1,46 +1,35 @@
 """Tests pour l'étape de caption (:mod:`src.caption`).
 
-Aucun appel réseau ni clé API : on injecte un faux client Anthropic.
+Aucun appel réseau : on injecte un faux client gradio.
 """
 
 from __future__ import annotations
 
-import base64
+import io
 
 import pytest
 from PIL import Image
 
 from src.caption import (
-    DEFAULT_MODEL,
-    SYSTEM_PROMPT,
+    DESCRIBE_PROMPT,
+    MAX_IMAGE_EDGE,
     CaptionError,
+    _prepare_image_file,
+    _to_text,
     describe_room,
 )
 
 
-class FakeBlock:
-    def __init__(self, text):
-        self.type = "text"
-        self.text = text
+class FakeClient:
+    """Imite gradio_client.Client : enregistre l'appel et rend (texte, durée)."""
 
-
-class FakeMessages:
-    def __init__(self, reply):
+    def __init__(self, reply="a cozy scandinavian living room, 360 panorama"):
         self.reply = reply
         self.calls = []
 
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-
-        class Resp:
-            content = [FakeBlock(self.reply)]
-
-        return Resp()
-
-
-class FakeClient:
-    def __init__(self, reply="a cozy scandinavian living room, 360 panorama"):
-        self.messages = FakeMessages(reply)
+    def predict(self, *args, api_name=None, fn_index=None):
+        self.calls.append({"args": args, "api_name": api_name, "fn_index": fn_index})
+        return (self.reply, "1.23s")
 
 
 @pytest.fixture
@@ -55,41 +44,28 @@ def test_describe_room_from_path(photo):
     prompt = describe_room(photo, client=client)
 
     assert prompt == "a cozy scandinavian living room, 360 panorama"
-    assert len(client.messages.calls) == 1
+    assert len(client.calls) == 1
 
 
-def test_uses_default_model_and_caches_system(photo):
+def test_describe_room_sends_image_and_prompt(photo):
     client = FakeClient()
     describe_room(photo, client=client)
-    call = client.messages.calls[0]
+    args = client.calls[0]["args"]
 
-    assert call["model"] == DEFAULT_MODEL
-    # Le system est mis en cache (préfixe stable).
-    assert call["system"][0]["text"] == SYSTEM_PROMPT
-    assert call["system"][0]["cache_control"] == {"type": "ephemeral"}
+    # (image, prompt) — le 2e argument est la consigne de description.
+    assert args[1] == DESCRIBE_PROMPT
 
 
-def test_image_sent_as_base64(photo):
+def test_extra_guidance_appended(photo):
     client = FakeClient()
-    describe_room(photo, client=client)
-    content = client.messages.calls[0]["messages"][0]["content"]
-
-    image_block = next(b for b in content if b["type"] == "image")
-    assert image_block["source"]["type"] == "base64"
-    assert image_block["source"]["media_type"] == "image/jpeg"
-    # Les données sont du base64 valide et non vide.
-    assert base64.standard_b64decode(image_block["source"]["data"])
+    describe_room(photo, client=client, extra_guidance="Style: minimalist.")
+    prompt_arg = client.calls[0]["args"][1]
+    assert "minimalist" in prompt_arg
 
 
 def test_describe_room_from_pil_image():
     client = FakeClient()
-    img = Image.new("RGB", (32, 32), (10, 20, 30))
-    prompt = describe_room(img, client=client)
-    assert prompt
-    media_type = client.messages.calls[0]["messages"][0]["content"][0]["source"][
-        "media_type"
-    ]
-    assert media_type == "image/jpeg"
+    assert describe_room(Image.new("RGB", (32, 32), (10, 20, 30)), client=client)
 
 
 def test_describe_room_from_ingested_image(photo):
@@ -103,33 +79,58 @@ def test_describe_room_from_ingested_image(photo):
     assert describe_room(ingested, client=client)
 
 
-def test_extra_guidance_appended(photo):
-    client = FakeClient()
-    describe_room(photo, client=client, extra_guidance="Style: minimaliste.")
-    content = client.messages.calls[0]["messages"][0]["content"]
-    text_block = next(b for b in content if b["type"] == "text")
-    assert "minimaliste" in text_block["text"]
+def test_falls_back_to_fn_index(photo):
+    class PickyClient(FakeClient):
+        def predict(self, *args, api_name=None, fn_index=None):
+            if api_name is not None:
+                raise ValueError("pas d'endpoint nommé")
+            return super().predict(*args, fn_index=fn_index)
+
+    client = PickyClient()
+    assert describe_room(photo, client=client)
+    assert client.calls[-1]["fn_index"] == 0
 
 
-def test_unsupported_extension(tmp_path):
-    bad = tmp_path / "room.tiff"
-    bad.write_bytes(b"not really a tiff")
-    with pytest.raises(CaptionError, match="non supporté"):
+def test_temp_file_is_cleaned_up(photo, monkeypatch):
+    seen = {}
+
+    class CapturingClient(FakeClient):
+        def predict(self, *args, api_name=None, fn_index=None):
+            # Le 1er arg référence le fichier temporaire (chemin ou handle_file).
+            seen["arg"] = args[0]
+            return super().predict(*args, api_name=api_name, fn_index=fn_index)
+
+    describe_room(photo, client=CapturingClient())
+    # Le fichier temporaire ne doit plus exister après l'appel.
+    arg = seen["arg"]
+    path = arg.get("path") if isinstance(arg, dict) else arg
+    from pathlib import Path
+
+    assert not Path(path).exists()
+
+
+def test_corrupt_image_raises(tmp_path):
+    bad = tmp_path / "room.jpg"
+    bad.write_bytes(b"not really a jpeg")
+    with pytest.raises(CaptionError, match="illisible|introuvable"):
         describe_room(bad, client=FakeClient())
 
 
-def test_empty_response_raises(photo):
-    client = FakeClient(reply="   ")
+def test_large_image_is_downscaled():
+    big = Image.new("RGB", (4000, 3000), (1, 2, 3))
+    path = _prepare_image_file(big)
+    try:
+        with Image.open(path) as decoded:
+            size = decoded.size
+        assert max(size) == MAX_IMAGE_EDGE
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_to_text_handles_tuple():
+    assert _to_text(("hello world", "0.5s")) == "hello world"
+
+
+def test_to_text_empty_raises():
     with pytest.raises(CaptionError, match="ne contient pas de texte"):
-        describe_room(photo, client=client)
-
-
-def test_sdk_error_wrapped(photo):
-    class BoomClient:
-        class messages:  # noqa: N801
-            @staticmethod
-            def create(**kwargs):
-                raise RuntimeError("network down")
-
-    with pytest.raises(CaptionError, match="API Anthropic"):
-        describe_room(photo, client=BoomClient())
+        _to_text(("   ", "0.1s"))

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -140,8 +141,8 @@ def forge(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="forge",
-        description="Pipeline pano-forge : photos d'intérieur → panorama 360° "
-        "→ requête World Labs.",
+        description="Pipeline pano-forge : photos d'interieur -> panorama 360 "
+        "-> requete World Labs.",
     )
     parser.add_argument(
         "input_dir",
@@ -176,10 +177,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_STEPS,
         help=f"Étapes de diffusion (par défaut : {DEFAULT_STEPS}).",
     )
+    parser.add_argument(
+        "-m",
+        "--min-images",
+        type=int,
+        default=MIN_IMAGES,
+        help=f"Nombre minimal de photos requis (par défaut : {MIN_IMAGES}).",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Le prompt généré peut contenir des caractères hors cp1252 ; force UTF-8
+    # sur les consoles Windows pour éviter un UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):  # pragma: no cover
+            pass
+
     args = _build_parser().parse_args(argv)
     try:
         result = forge(
@@ -188,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             backend=args.backend,
             seed=args.seed,
             num_inference_steps=args.num_inference_steps,
+            min_images=args.min_images,
         )
     except (IngestError, CaptionError, PanoramaError) as exc:
         print(f"[forge] Erreur : {exc}")

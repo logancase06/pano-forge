@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pano-forge : photos sources et artefacts générés (on garde les dossiers)
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+examples/*
+!examples/.gitkeep

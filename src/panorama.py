@@ -154,7 +154,15 @@ class HFSpaceBackend:
                 "gradio_client est requis pour le backend Space. "
                 "Installe-le : pip install gradio_client"
             ) from exc
-        self._client = Client(self.space_id, hf_token=self.hf_token)
+        if self.hf_token:
+            # Le nom du kwarg a changé selon les versions : token (>=2.x) vs
+            # hf_token (1.x).
+            try:
+                self._client = Client(self.space_id, token=self.hf_token)
+            except TypeError:
+                self._client = Client(self.space_id, hf_token=self.hf_token)
+        else:
+            self._client = Client(self.space_id)
         return self._client
 
     def generate(
