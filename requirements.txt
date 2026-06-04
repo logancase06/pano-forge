@@ -1,0 +1,10 @@
+# pano-forge dependencies
+
+# Image I/O, EXIF handling
+Pillow>=10.2.0
+
+# Numerical / array ops (used by panorama stitching & forge stages)
+numpy>=1.26.0
+
+# Tests
+pytest>=8.0.0
