@@ -9,6 +9,9 @@ numpy>=1.26.0
 # Panorama generation via the hosted DiT360 Gradio Space (free, no GPU)
 gradio_client>=1.3.0
 
+# Photo -> prompt captioning via the Anthropic Claude API
+anthropic>=0.49.0
+
 # Local DiT360 backend (optional, GPU/CUDA) — uncomment to run the model locally
 # diffusers>=0.30.0
 # torch>=2.2.0
