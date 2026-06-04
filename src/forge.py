@@ -232,15 +232,18 @@ def _image_prompt_base64(path: str | Path) -> dict:
     }
 
 
-def _upload_media_asset(path: str | Path, *, api_key: str, transport, upload) -> str:
-    """Prépare et upload un media-asset, retourne son id (flux image-blaster)."""
+def _upload_media_asset(
+    path: str | Path, *, api_key: str, transport, upload, kind: str = "image"
+) -> str:
+    """Prépare et upload un media-asset (image ou vidéo), retourne son id."""
     path = Path(path)
-    extension = path.suffix.lstrip(".").lower() or "png"
+    fallback_ext = "mp4" if kind == "video" else "png"
+    extension = path.suffix.lstrip(".").lower() or fallback_ext
     prepare = transport(
         f"{WORLD_LABS_ENDPOINT}/media-assets:prepare_upload",
         api_key=api_key,
         method="POST",
-        payload={"file_name": path.name, "kind": "image", "extension": extension},
+        payload={"file_name": path.name, "kind": kind, "extension": extension},
     )
     asset = prepare.get("media_asset") or {}
     asset_id = (
@@ -317,6 +320,36 @@ def _build_world_request(
     }
 
 
+def _build_video_request(
+    video_path: str | Path,
+    *,
+    prompt: str | None,
+    display_name: str,
+    api_key: str,
+    transport,
+    upload,
+) -> dict:
+    """Construit le corps ``worlds:generate`` pour une entrée vidéo.
+
+    La vidéo est uploadée en media-asset (``kind: video``), référencée par
+    ``video_prompt.media_asset_id`` (format confirmé par la doc World Labs).
+    """
+    asset_id = _upload_media_asset(
+        video_path, api_key=api_key, transport=transport, upload=upload, kind="video"
+    )
+    world_prompt = {
+        "type": "video",
+        "video_prompt": {"source": "media_asset", "media_asset_id": asset_id},
+    }
+    if prompt:
+        world_prompt["text_prompt"] = prompt
+    return {
+        "display_name": display_name,
+        "model": WORLD_LABS_MODEL,
+        "world_prompt": world_prompt,
+    }
+
+
 def _operation_id(operation: dict) -> str:
     op_id = (
         operation.get("operation_id")
@@ -329,8 +362,9 @@ def _operation_id(operation: dict) -> str:
 
 
 def submit_world_labs(
-    images,
+    images=None,
     *,
+    video: str | Path | None = None,
     prompt: str | None = None,
     display_name: str = "pano-forge",
     api_key: str | None = None,
@@ -342,12 +376,18 @@ def submit_world_labs(
 ) -> dict:
     """Génère un monde 3D World Labs : submit puis polling jusqu'à ``done``.
 
-    ``images`` : un chemin (single-image), ou une liste de chemins / de
-    ``(chemin, azimuth)`` (multi-image). Logique portée d'``image-blaster``
-    (``generate-world.mjs``) : single en ``data_base64`` inline, multi via
-    upload media-asset. La clé est lue depuis ``api_key`` ou
-    ``WORLD_LABS_API_KEY``. Retourne ``operation.response`` (assets du monde).
+    Entrée (exclusive) :
+    - ``images`` : un chemin (single-image, ``data_base64``), ou une liste de
+      chemins / ``(chemin, azimuth)`` (multi-image, upload media-asset) ;
+    - ``video`` : un chemin de vidéo (upload media-asset ``kind: video``,
+      ``world_prompt.type = "video"``).
+
+    Logique portée d'``image-blaster`` (``generate-world.mjs``). La clé est lue
+    depuis ``api_key`` ou ``WORLD_LABS_API_KEY``. Retourne ``operation.response``.
     """
+    if images is None and video is None:
+        raise WorldLabsError("Fournis 'images' ou 'video'.")
+
     api_key = api_key or os.environ.get(WORLD_LABS_API_KEY_ENV)
     if not api_key:
         raise WorldLabsError(
@@ -356,17 +396,26 @@ def submit_world_labs(
 
     transport = _transport or _request_json
     upload = _upload or _put_file
-    items = _normalize_images(images)
 
-    request = _build_world_request(
-        items,
-        prompt=prompt,
-        display_name=display_name,
-        multi=multi,
-        api_key=api_key,
-        transport=transport,
-        upload=upload,
-    )
+    if video is not None:
+        request = _build_video_request(
+            video,
+            prompt=prompt,
+            display_name=display_name,
+            api_key=api_key,
+            transport=transport,
+            upload=upload,
+        )
+    else:
+        request = _build_world_request(
+            _normalize_images(images),
+            prompt=prompt,
+            display_name=display_name,
+            multi=multi,
+            api_key=api_key,
+            transport=transport,
+            upload=upload,
+        )
 
     operation = transport(
         f"{WORLD_LABS_ENDPOINT}/worlds:generate",
@@ -468,6 +517,7 @@ def forge(
     *,
     backend: str = DEFAULT_BACKEND,
     multi: bool = False,
+    video: str | Path | None = None,
     seed: int = DEFAULT_SEED,
     num_inference_steps: int = DEFAULT_STEPS,
     min_images: int = MIN_IMAGES,
@@ -476,14 +526,16 @@ def forge(
     extra_guidance: str | None = None,
     hf_token: str | None = None,
 ) -> PipelineResult:
-    """Exécute le pipeline depuis un dossier de photos.
+    """Exécute le pipeline depuis un dossier de photos (ou une vidéo).
 
     Args:
-        input_dir: dossier des photos sources.
+        input_dir: dossier des photos sources (ignoré si ``video``).
         output_dir: dossier de sortie.
         backend: ``"worldlabs"`` (défaut, photo réelle → World Labs) ou
             ``"dit360"`` (caption → panorama DiT360 → World Labs).
         multi: en backend worldlabs, envoie jusqu'à 4 photos en multi-image.
+        video: chemin d'une vidéo → World Labs en ``type: video`` (prioritaire
+            sur les photos).
         seed / num_inference_steps: paramètres DiT360 (backend dit360).
         min_images: nombre minimal de photos requis.
         submit: si vrai, génère réellement le monde World Labs (paie) et
@@ -492,6 +544,41 @@ def forge(
         extra_guidance: consignes de style pour la caption (backend dit360).
         hf_token: token HF optionnel pour la caption (backend dit360).
     """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # --- entrée vidéo : court-circuite ingest/photos ---
+    if video is not None:
+        video_path = Path(video)
+        if not video_path.exists():
+            raise WorldLabsError(f"Vidéo introuvable : {video_path}")
+        manifest = {
+            "endpoint": WORLD_LABS_ENDPOINT,
+            "model": WORLD_LABS_MODEL,
+            "backend": "video",
+            "video": str(video_path),
+            "prompt": None,
+        }
+        (out / "world_labs_request.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+        world = None
+        world_assets = None
+        if submit:
+            world = submit_world_labs(
+                video=video_path, display_name=out.name or "pano-forge"
+            )
+            world_assets = download_world_assets(world, out)
+        return PipelineResult(
+            backend="video",
+            source_images=[video_path],
+            prompt=None,
+            panorama=None,
+            world_labs_request=manifest,
+            world=world,
+            world_assets=world_assets,
+        )
+
     if backend not in (BACKEND_WORLDLABS, BACKEND_DIT360):
         raise ValueError(
             f"Backend inconnu : {backend!r}. "
@@ -499,8 +586,6 @@ def forge(
         )
 
     images = ingest(input_dir, min_images=min_images)
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
 
     prompt: str | None = None
     panorama: Panorama | None = None
@@ -592,6 +677,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Backend worldlabs : envoie jusqu'à {MULTI_IMAGE_LIMIT} photos en multi-image.",
     )
     parser.add_argument(
+        "--video",
+        default=None,
+        help="Chemin d'une vidéo à envoyer à World Labs (type video, prioritaire sur les photos).",
+    )
+    parser.add_argument(
         "-s",
         "--seed",
         type=int,
@@ -636,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir,
             backend=args.backend,
             multi=args.multi,
+            video=args.video,
             seed=args.seed,
             num_inference_steps=args.num_inference_steps,
             min_images=args.min_images,
@@ -647,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[forge] Backend : {result.backend}")
     for path in result.source_images:
-        print(f"[forge] Image source : {path}")
+        print(f"[forge] Source : {path}")
     if result.prompt:
         print(f"[forge] Prompt : {result.prompt}")
 

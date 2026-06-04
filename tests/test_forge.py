@@ -19,6 +19,7 @@ from src.forge import (
     WORLD_LABS_MODEL,
     PipelineResult,
     WorldLabsError,
+    _build_video_request,
     _build_world_request,
     _operation_id,
     _select_images,
@@ -210,6 +211,94 @@ def test_build_world_request_multi_uploads(tmp_path):
     assert entries[0]["content"]["source"] == "media_asset"
     assert entries[1]["azimuth"] == 180
     assert len(uploaded) == 2
+
+
+def test_build_video_request_uploads_as_video(tmp_path):
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"fake video bytes")
+    captured = {}
+
+    def transport(url, *, api_key, method="GET", payload=None):
+        captured["kind"] = payload["kind"]
+        captured["extension"] = payload["extension"]
+        return {
+            "media_asset": {"media_asset_id": "vid-1"},
+            "upload_info": {"upload_url": "http://up/x"},
+        }
+
+    def upload(url, path, *, method="PUT", headers=None):
+        captured["uploaded"] = str(path)
+
+    req = _build_video_request(
+        vid, prompt="a room", display_name="demo",
+        api_key="k", transport=transport, upload=upload,
+    )
+    assert req["model"] == WORLD_LABS_MODEL
+    assert req["world_prompt"]["type"] == "video"
+    assert req["world_prompt"]["video_prompt"] == {
+        "source": "media_asset",
+        "media_asset_id": "vid-1",
+    }
+    assert req["world_prompt"]["text_prompt"] == "a room"
+    assert captured["kind"] == "video"
+    assert captured["extension"] == "mp4"
+
+
+def test_submit_world_labs_video(tmp_path):
+    vid = tmp_path / "clip.mov"
+    vid.write_bytes(b"x")
+
+    def transport(url, *, api_key, method="GET", payload=None):
+        if url.endswith("prepare_upload"):
+            return {
+                "media_asset": {"media_asset_id": "v"},
+                "upload_info": {"upload_url": "http://up/x"},
+            }
+        return {"operation_id": "o", "done": True, "response": {"assets": {"v": 1}}}
+
+    def upload(url, path, *, method="PUT", headers=None):
+        pass
+
+    world = submit_world_labs(
+        video=vid, api_key="k", poll_interval=0, _transport=transport, _upload=upload
+    )
+    assert world == {"assets": {"v": 1}}
+
+
+def test_submit_world_labs_requires_input():
+    with pytest.raises(WorldLabsError, match="images.*video|video"):
+        submit_world_labs(api_key="k", _transport=lambda *a, **k: {})
+
+
+def test_forge_video_skips_ingest(tmp_path, monkeypatch):
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"x")
+    captured = {}
+
+    def fake_submit(images=None, *, video=None, prompt=None, display_name="pano-forge", multi=False):
+        captured["video"] = video
+        return {"assets": {}}
+
+    def boom_ingest(*a, **k):
+        raise AssertionError("ingest ne doit pas tourner en mode vidéo")
+
+    monkeypatch.setattr(forge_module, "ingest", boom_ingest)
+    monkeypatch.setattr(forge_module, "submit_world_labs", fake_submit)
+    monkeypatch.setattr(forge_module, "download_world_assets", lambda w, o: {})
+
+    result = forge(tmp_path / "input", tmp_path / "out", video=vid, submit=True)
+    assert result.backend == "video"
+    assert result.source_images == [vid]
+    assert captured["video"] == vid
+    manifest = json.loads(
+        (tmp_path / "out" / "world_labs_request.json").read_text(encoding="utf-8")
+    )
+    assert manifest["backend"] == "video"
+
+
+def test_forge_video_missing_file(tmp_path):
+    with pytest.raises(WorldLabsError, match="introuvable"):
+        forge(tmp_path / "input", tmp_path / "out", video=tmp_path / "nope.mp4")
 
 
 def test_operation_id_extracts_last_segment():
