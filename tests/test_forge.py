@@ -85,6 +85,21 @@ def test_select_images_multi_limit():
     assert len(_select_images(imgs, multi=True)) == MULTI_IMAGE_LIMIT
 
 
+def test_select_images_multi_maximizes_diversity():
+    # Deux rouges quasi identiques + 3 couleurs distinctes : la sélection doit
+    # prendre les vues distinctes et écarter l'un des doublons rouges.
+    imgs = [
+        FakeImg(100, 100, "red.jpg", (255, 0, 0)),
+        FakeImg(100, 100, "red2.jpg", (250, 5, 5)),
+        FakeImg(100, 100, "green.jpg", (0, 255, 0)),
+        FakeImg(100, 100, "blue.jpg", (0, 0, 255)),
+        FakeImg(100, 100, "yellow.jpg", (255, 255, 0)),
+    ]
+    chosen = {im.path.name for im in _select_images(imgs, multi=True)}
+    assert {"green.jpg", "blue.jpg", "yellow.jpg"} <= chosen
+    assert len({"red.jpg", "red2.jpg"} & chosen) == 1  # un seul des deux rouges
+
+
 # --- backend worldlabs (défaut) ---------------------------------------------
 
 

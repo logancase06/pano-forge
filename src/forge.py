@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
+import numpy as np
 from PIL import Image
 
 from src.caption import CaptionError, describe_room
@@ -87,12 +88,67 @@ class PipelineResult:
 # ---------------------------------------------------------------------------
 
 
+def _color_histogram(pil_image: Image.Image, *, bins: int = 8) -> np.ndarray:
+    """Histogramme couleur RGB normalisé — descripteur perceptuel léger.
+
+    L'image est réduite (rapidité) ; on concatène les histogrammes des 3 canaux
+    et on normalise. Deux vues très similaires (même mur, même cadrage) ont des
+    histogrammes proches ; des angles différents divergent.
+    """
+    img = pil_image.convert("RGB").resize((64, 64))
+    arr = np.asarray(img, dtype=np.float64)
+    channels = [
+        np.histogram(arr[:, :, c], bins=bins, range=(0, 255))[0] for c in range(3)
+    ]
+    hist = np.concatenate(channels)
+    total = hist.sum()
+    return hist / total if total else hist
+
+
+def _diverse_indices(feats: list[np.ndarray], k: int) -> list[int]:
+    """Farthest-point sampling : indices des ``k`` descripteurs les plus diversifiés.
+
+    Distance L1 entre histogrammes. Amorçage déterministe sur le descripteur le
+    plus éloigné de la moyenne (le plus distinctif), puis ajout glouton de
+    l'image qui maximise la distance minimale à l'ensemble déjà choisi.
+    """
+    matrix = np.asarray(feats)
+    n = len(matrix)
+
+    def l1(i: int, j: int) -> float:
+        return float(np.abs(matrix[i] - matrix[j]).sum())
+
+    mean = matrix.mean(axis=0)
+    seed = int(np.argmax(np.abs(matrix - mean).sum(axis=1)))
+    selected = [seed]
+    while len(selected) < k:
+        best_idx, best_dist = None, -1.0
+        for j in range(n):
+            if j in selected:
+                continue
+            d = min(l1(j, s) for s in selected)
+            if d > best_dist:
+                best_dist, best_idx = d, j
+        selected.append(best_idx)
+    return selected
+
+
 def _select_images(images: list, *, multi: bool) -> list:
-    """Trie les images par résolution décroissante et garde la/les meilleure(s)."""
-    ordered = sorted(
-        images, key=lambda im: (-(im.width * im.height), im.path.name.lower())
-    )
-    return ordered[:MULTI_IMAGE_LIMIT] if multi else ordered[:1]
+    """Sélectionne les photos sources pour World Labs.
+
+    - **single** : la plus haute résolution (meilleure qualité d'ancrage).
+    - **multi** : les ``MULTI_IMAGE_LIMIT`` photos les plus **diversifiées** en
+      vue/angle (histogrammes couleur + farthest-point sampling), pour couvrir
+      au mieux la pièce plutôt que 4 quasi-doublons.
+    """
+    if not multi:
+        return sorted(
+            images, key=lambda im: (-(im.width * im.height), im.path.name.lower())
+        )[:1]
+    if len(images) <= MULTI_IMAGE_LIMIT:
+        return list(images)
+    feats = [_color_histogram(im.image) for im in images]
+    return [images[i] for i in _diverse_indices(feats, MULTI_IMAGE_LIMIT)]
 
 
 def _export_image(pil_image: Image.Image, dest: str | Path, *, max_edge: int = MAX_SOURCE_EDGE) -> Path:
