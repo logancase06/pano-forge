@@ -184,10 +184,58 @@ def test_forge_submit_calls_world_labs(tmp_path, patched, monkeypatch):
         return {"assets": {"imagery": {"pano_url": "http://x/p.png"}}}
 
     monkeypatch.setattr(forge_module, "submit_world_labs", fake_submit)
+    monkeypatch.setattr(
+        forge_module, "download_world_assets", lambda world, out: {"pano": out / "p"}
+    )
     result = forge(tmp_path / "input", tmp_path / "out", submit=True)
 
     assert result.world == {"assets": {"imagery": {"pano_url": "http://x/p.png"}}}
     assert captured["prompt"] == "a cozy 360 living room"
+    assert result.world_assets == {"pano": (tmp_path / "out") / "p"}
+
+
+def test_download_world_assets(tmp_path, monkeypatch):
+    world = {
+        "assets": {
+            "mesh": {"collider_mesh_url": "http://x/a.glb"},
+            "imagery": {"pano_url": "http://x/p.png"},
+            "thumbnail_url": "http://x/t.webp",
+            "splats": {
+                "spz_urls": {
+                    "100k": "http://x/s100.spz",
+                    "full_res": "http://x/sfull.spz",
+                }
+            },
+        }
+    }
+    seen = []
+
+    def fake_dl(url, dest):
+        from pathlib import Path
+
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x")
+        seen.append(url)
+        return dest
+
+    monkeypatch.setattr(forge_module, "_download_file", fake_dl)
+    res = forge_module.download_world_assets(world, tmp_path)
+
+    assert res["glb"].name == "world.glb"
+    assert res["pano"].name == "world-pano.png"
+    assert res["thumbnail"].name == "world-thumbnail.webp"
+    assert set(res["spz"]) == {"100k", "full_res"}
+    assert res["spz"]["100k"].name == "world-100k.spz"
+    assert len(seen) == 5
+
+
+def test_download_world_assets_handles_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        forge_module, "_download_file", lambda url, dest: dest
+    )
+    res = forge_module.download_world_assets({"assets": {}}, tmp_path)
+    assert res == {"spz": {}}
 
 
 def test_main_success(tmp_path, patched, capsys):

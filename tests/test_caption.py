@@ -127,6 +127,41 @@ def test_large_image_is_downscaled():
         path.unlink(missing_ok=True)
 
 
+def test_default_client_passes_hf_token(monkeypatch):
+    import gradio_client
+
+    import src.caption as cap
+
+    created = {}
+
+    class FakeClient:
+        def __init__(self, space_id, token=None, **kw):
+            created["space_id"] = space_id
+            created["token"] = token
+
+    monkeypatch.setattr(gradio_client, "Client", FakeClient)
+    monkeypatch.setenv("HF_TOKEN", "hf_secret")
+    cap._default_client("some/space")
+    assert created["token"] == "hf_secret"
+
+
+def test_default_client_no_token(monkeypatch):
+    import gradio_client
+
+    import src.caption as cap
+
+    created = {}
+
+    class FakeClient:
+        def __init__(self, space_id, token=None, **kw):
+            created["token"] = token
+
+    monkeypatch.setattr(gradio_client, "Client", FakeClient)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    cap._default_client("some/space")
+    assert created["token"] is None
+
+
 def test_to_text_handles_tuple():
     assert _to_text(("hello world", "0.5s")) == "hello world"
 

@@ -30,6 +30,7 @@ dépendance.
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 from pathlib import Path
 
@@ -130,7 +131,12 @@ def _to_text(result) -> str:
     return text
 
 
-def _default_client(space_id: str):
+def _default_client(space_id: str, hf_token: str | None = None):
+    """Construit un client gradio, en authentifiant si un token HF est dispo.
+
+    Un token HF (argument ``hf_token`` ou variable d'environnement ``HF_TOKEN``)
+    relève le quota ZeroGPU des Spaces ; il reste **optionnel**.
+    """
     try:
         from gradio_client import Client
     except ImportError as exc:  # pragma: no cover - dépend de l'install
@@ -138,6 +144,14 @@ def _default_client(space_id: str):
             "gradio_client est requis pour la caption. "
             "Installe-le : pip install gradio_client"
         ) from exc
+
+    token = hf_token or os.environ.get("HF_TOKEN")
+    if token:
+        # Le nom du kwarg a changé : token (>=2.x) vs hf_token (1.x).
+        try:
+            return Client(space_id, token=token)
+        except TypeError:
+            return Client(space_id, hf_token=token)
     return Client(space_id)
 
 
@@ -158,6 +172,7 @@ def describe_room(
     space_id: str = DEFAULT_SPACE_ID,
     api_name: str | None = DEFAULT_API_NAME,
     extra_guidance: str | None = None,
+    hf_token: str | None = None,
 ) -> str:
     """Décrit une photo d'intérieur en prompt texte pour DiT360, via Qwen-VL.
 
@@ -169,6 +184,8 @@ def describe_room(
         api_name: endpoint gradio nommé (fallback ``fn_index=0`` sinon).
         extra_guidance: instructions supplémentaires (style, contraintes…)
             ajoutées au prompt.
+        hf_token: token Hugging Face optionnel (sinon ``HF_TOKEN``) pour
+            relever le quota ZeroGPU du Space.
 
     Returns:
         Le prompt descriptif (chaîne non vide).
@@ -179,7 +196,11 @@ def describe_room(
 
     image_path = _prepare_image_file(source)
     try:
-        engine = client if client is not None else _default_client(space_id)
+        engine = (
+            client
+            if client is not None
+            else _default_client(space_id, hf_token=hf_token)
+        )
         file_arg = _as_file_arg(image_path)
 
         # Tente l'endpoint nommé puis retombe sur fn_index=0 (cf. avertissement).

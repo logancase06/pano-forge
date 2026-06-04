@@ -22,12 +22,14 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from src.caption import CaptionError, describe_room
 from src.ingest import MIN_IMAGES, IngestError, ingest
@@ -59,6 +61,7 @@ class PipelineResult:
     panorama_path: Path
     world_labs_request: dict = field(default_factory=dict)
     world: dict | None = None  # réponse World Labs si --submit
+    world_assets: dict | None = None  # assets téléchargés si --submit
 
 
 def prepare_world_labs(
@@ -215,6 +218,60 @@ def submit_world_labs(
     return response
 
 
+def _download_file(url: str, dest: str | Path) -> Path:
+    """Télécharge ``url`` vers ``dest`` (stdlib urllib)."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(url) as resp, open(dest, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+    except (urllib.error.URLError, OSError) as exc:
+        raise WorldLabsError(f"Téléchargement échoué : {url} ({exc})") from exc
+    return dest
+
+
+def _ext_from_url(url: str, fallback: str) -> str:
+    """Extension de fichier déduite d'une URL (sinon ``fallback``)."""
+    return Path(urlparse(url).path).suffix or fallback
+
+
+def download_world_assets(
+    world: dict, output_dir: str | Path, *, prefix: str = "world"
+) -> dict:
+    """Télécharge les assets d'un monde World Labs dans ``output_dir``.
+
+    Mêmes assets que ``image-blaster`` (``downloadWorldAssets``) : mesh GLB,
+    pano équirectangulaire, thumbnail, et splats ``.spz`` (toutes résolutions).
+    Retourne un dict des chemins locaux ({"glb", "pano", "thumbnail", "spz": {...}}).
+    """
+    assets = world.get("assets", {}) or {}
+    out = Path(output_dir)
+    result: dict = {"spz": {}}
+
+    glb_url = (assets.get("mesh") or {}).get("collider_mesh_url")
+    if glb_url:
+        result["glb"] = _download_file(glb_url, out / f"{prefix}.glb")
+
+    pano_url = (assets.get("imagery") or {}).get("pano_url")
+    if pano_url:
+        ext = _ext_from_url(pano_url, ".png")
+        result["pano"] = _download_file(pano_url, out / f"{prefix}-pano{ext}")
+
+    thumb_url = assets.get("thumbnail_url")
+    if thumb_url:
+        ext = _ext_from_url(thumb_url, ".webp")
+        result["thumbnail"] = _download_file(thumb_url, out / f"{prefix}-thumbnail{ext}")
+
+    spz_urls = (assets.get("splats") or {}).get("spz_urls") or {}
+    for key, url in spz_urls.items():
+        if not url:
+            continue
+        safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(key))
+        result["spz"][key] = _download_file(url, out / f"{prefix}-{safe}.spz")
+
+    return result
+
+
 def forge(
     input_dir: str | Path,
     output_dir: str | Path = "output",
@@ -264,12 +321,14 @@ def forge(
     )
 
     world = None
+    world_assets = None
     if submit:
         world = submit_world_labs(
             panorama_path,
             prompt=panorama.prompt,
             display_name=out.name or "pano-forge",
         )
+        world_assets = download_world_assets(world, out)
 
     return PipelineResult(
         prompt=prompt,
@@ -277,6 +336,7 @@ def forge(
         panorama_path=panorama_path,
         world_labs_request=world_labs_request,
         world=world,
+        world_assets=world_assets,
     )
 
 
@@ -362,10 +422,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[forge] Panorama : {result.panorama_path}")
     if result.world is not None:
         assets = result.world.get("assets", {})
-        pano_url = assets.get("imagery", {}).get("pano_url")
         print(f"[forge] Monde World Labs généré (assets : {list(assets)}).")
-        if pano_url:
-            print(f"[forge] Pano World Labs : {pano_url}")
+        downloaded = result.world_assets or {}
+        for kind in ("glb", "pano", "thumbnail"):
+            if downloaded.get(kind):
+                print(f"[forge]   {kind}: {downloaded[kind]}")
+        for key, path in (downloaded.get("spz") or {}).items():
+            print(f"[forge]   spz[{key}]: {path}")
     else:
         print(
             f"[forge] Requête World Labs préparée "
