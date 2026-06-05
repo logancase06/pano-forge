@@ -4,7 +4,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.11-blue.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Tests](https://img.shields.io/badge/tests-71%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-78%20passing-brightgreen.svg)
 
 pano-forge transforme de vraies photos d'intérieur (ou une vidéo de marche dans
 la pièce) en un **monde 3D explorable** — mesh, panorama équirectangulaire et
@@ -24,8 +24,8 @@ pip install -r requirements.txt
 ```
 
 Python 3.11+. Le cœur du pipeline n'a besoin que de `gradio_client` et `Pillow`
-(`numpy` pour la sélection par diversité) ; `opencv-python-headless` n'est requis
-que pour `--mix`.
+(`numpy` pour la sélection par diversité) ; `opencv-python-headless` et `tqdm` ne
+sont requis que pour `--mix`.
 
 ---
 
@@ -75,7 +75,7 @@ python -m src.forge --video input/walkthrough.mp4 --submit
 ### 4. Mix vidéo + photos — `--mix`
 Assemble **un seul MP4** intelligent et l'envoie en mode `video` — aucune limite
 de 4 images : World Labs voit la vidéo **et** toutes les photos. Le montage est
-optimisé sur 4 points :
+optimisé :
 
 1. **Détection de mouvement** : au lieu de recopier la vidéo entière, on ne garde
    que les `--frames` keyframes au plus fort changement visuel (différence
@@ -86,10 +86,16 @@ optimisé sur 4 points :
 3. **Photos tenues ~5 s** chacune (`--still-seconds`).
 4. **Léger flou de mouvement** sur les photos fixes pour qu'elles ressemblent à
    des frames vidéo naturelles — mieux intégrées par World Labs.
+5. **Auto-luminosité** : les photos sombres sont ré-égalisées (histogramme) pour
+   coller à la luminosité des frames vidéo.
+6. **Filtre de netteté** : photos et frames trop floues (score Laplacien
+   `< --min-sharpness`, défaut 50) sont écartées automatiquement.
+
+Une **barre de progression** (tqdm) s'affiche pendant l'encodage du MP4.
 
 ```bash
 python -m src.forge --video input/walkthrough.mp4 --mix --submit
-# durée par photo : --still-seconds 6 ; keyframes gardés : --frames 80
+# durée par photo : --still-seconds 6 ; keyframes : --frames 80 ; netteté min : --min-sharpness 80
 ```
 
 ### Backend alternatif — `--backend dit360`
@@ -111,6 +117,7 @@ python -m src.forge input/ --backend dit360 --submit
 | `--mix` | MP4 combiné keyframes vidéo + photos intercalées (avec `--video`). |
 | `--still-seconds N` | Durée de chaque photo dans le MP4 mix (défaut 5). |
 | `--frames N` | Keyframes vidéo gardés pour le MP4 mix (défaut 50). |
+| `--min-sharpness N` | Seuil de netteté ; photos/frames plus floues sont écartées du mix (défaut 50). |
 | `-m, --min-images N` | Nombre minimal de photos requis (défaut 3). |
 | `--backend {worldlabs,dit360}` | Choix du backend (défaut `worldlabs`). |
 

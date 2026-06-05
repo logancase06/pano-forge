@@ -72,6 +72,17 @@ DEFAULT_STILL_SECONDS = 5.0
 DEFAULT_MIX_FRAMES = 50
 MIX_KEYFRAME_SECONDS = 0.2
 
+# --mix qualité : seuil de netteté (variance du Laplacien) sous lequel une image
+# est jugée trop floue et écartée ; et luminance moyenne sous laquelle une photo
+# est jugée « sombre » et ré-égalisée pour coller aux frames vidéo.
+DEFAULT_MIN_SHARPNESS = 50.0
+DARK_LUMA_THRESHOLD = 100.0
+
+# Retry World Labs : un 500/503 transitoire est retenté quelques fois avant abandon.
+WORLD_LABS_RETRY_STATUSES = (500, 503)
+WORLD_LABS_MAX_RETRIES = 3
+WORLD_LABS_RETRY_DELAY = 10.0
+
 
 class WorldLabsError(Exception):
     """Erreur levée lors d'un échec d'appel à l'API World Labs."""
@@ -190,18 +201,54 @@ def _letterbox_bgr(pil_image: Image.Image, width: int, height: int) -> np.ndarra
     return canvas[:, :, ::-1].copy()  # RGB -> BGR, contigu
 
 
-def _select_motion_frames(scores: list[float], max_frames: int) -> list[int]:
+def _sharpness(image_bgr: np.ndarray) -> float:
+    """Score de netteté = variance du Laplacien (faible => image floue)."""
+    import cv2
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _mean_luma(image_bgr: np.ndarray) -> float:
+    """Luminance moyenne (0-255) d'une image BGR."""
+    import cv2
+
+    return float(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).mean())
+
+
+def _auto_brightness_bgr(
+    image_bgr: np.ndarray, *, dark_threshold: float = DARK_LUMA_THRESHOLD
+) -> np.ndarray:
+    """Égalise l'histogramme de luminance des images sombres.
+
+    Seules les images dont la luminance moyenne est sous ``dark_threshold`` sont
+    corrigées (egalisation du canal Y en YCrCb, les couleurs sont préservées),
+    pour que les photos sombres collent à la luminosité des frames vidéo.
+    """
+    import cv2
+
+    if _mean_luma(image_bgr) >= dark_threshold:
+        return image_bgr
+    ycrcb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YCrCb)
+    ycrcb[:, :, 0] = cv2.equalizeHist(ycrcb[:, :, 0])
+    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+
+def _select_motion_frames(
+    scores: list[float], max_frames: int, *, eligible: list[int] | None = None
+) -> list[int]:
     """Indices des frames au plus fort changement visuel, en ordre temporel.
 
     ``scores[i]`` = différence inter-frame de la frame ``i`` (mouvement caméra).
     On garde les ``max_frames`` plus mouvementées — les **vrais nouveaux angles**
     — puis on les remet en ordre chronologique pour un montage cohérent.
+    ``eligible`` restreint la sélection à un sous-ensemble (frames assez nettes).
     """
-    n = len(scores)
-    if n == 0:
+    candidates = list(range(len(scores))) if eligible is None else list(eligible)
+    if not candidates:
         return []
-    keep = min(max_frames, n)
-    top = sorted(range(n), key=lambda i: (scores[i], i), reverse=True)[:keep]
+    keep = min(max_frames, len(candidates))
+    top = sorted(candidates, key=lambda i: (scores[i], i), reverse=True)[:keep]
     return sorted(top)
 
 
@@ -249,17 +296,22 @@ def _build_mix_video(
     *,
     still_seconds: float = DEFAULT_STILL_SECONDS,
     max_frames: int = DEFAULT_MIX_FRAMES,
+    min_sharpness: float = DEFAULT_MIN_SHARPNESS,
 ) -> Path:
     """Assemble un MP4 : keyframes vidéo mouvementés + photos intercalées.
 
     1. **Détection de mouvement** : les frames consécutives sont comparées et on
        ne garde que les ``max_frames`` au plus fort changement visuel (les vrais
        nouveaux angles), en ordre chronologique.
-    2. **Intercalage intelligent** : chaque photo (légèrement floutée pour
-       ressembler à une frame vidéo) est insérée après le keyframe le plus
-       similaire et tenue ~``still_seconds`` secondes.
+    2. **Intercalage intelligent** : chaque photo est insérée après le keyframe
+       le plus similaire et tenue ~``still_seconds`` secondes.
+    3. **Netteté** : photos et frames dont la netteté (Laplacien) est sous
+       ``min_sharpness`` sont écartées (garde-fou : si toutes les frames sont
+       écartées, on retombe sur l'ensemble complet pour ne pas vider la vidéo).
+    4. **Luminosité / flou** : les photos sombres sont ré-égalisées puis
+       légèrement floutées pour ressembler à des frames vidéo naturelles.
 
-    Import paresseux d'``cv2`` (requis seulement pour ``--mix``).
+    Imports paresseux d'``cv2`` / ``tqdm`` (requis seulement pour ``--mix``).
     """
     try:
         import cv2
@@ -268,6 +320,10 @@ def _build_mix_video(
             "opencv-python est requis pour --mix. "
             "Installe-le : pip install opencv-python-headless"
         ) from exc
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover - tqdm optionnel
+        tqdm = None
 
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
@@ -279,9 +335,10 @@ def _build_mix_video(
         cap.release()
         raise WorldLabsError(f"Vidéo illisible : {video_path}")
 
-    # Passe 1 : descripteurs légers (64x64) de chaque frame + score de mouvement.
+    # Passe 1 : descripteur léger (64x64), score de mouvement et netteté par frame.
     small_frames: list[np.ndarray] = []  # BGR réduit, pour la similarité photos
     scores: list[float] = []
+    sharp: list[float] = []
     prev_gray = None
     while True:
         ok, frame = cap.read()
@@ -290,20 +347,43 @@ def _build_mix_video(
         small = cv2.resize(frame, (64, 64))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         scores.append(0.0 if prev_gray is None else float(cv2.absdiff(gray, prev_gray).mean()))
+        sharp.append(_sharpness(frame))
         prev_gray = gray
         small_frames.append(small)
     cap.release()
     if not small_frames:
         raise WorldLabsError(f"Vidéo sans frames lisibles : {video_path}")
 
-    selected = _select_motion_frames(scores, max_frames)
+    # Écarte les frames floues ; garde-fou si plus rien ne passe le seuil.
+    eligible = [i for i in range(len(scores)) if sharp[i] >= min_sharpness]
+    if not eligible:
+        eligible = list(range(len(scores)))
+    selected = _select_motion_frames(scores, max_frames, eligible=eligible)
 
-    # Intercalage : keyframe le plus proche de chaque photo (histogrammes couleur).
+    # Écarte les photos floues, puis intercale par similarité (histogrammes).
+    photo_bgr = [
+        cv2.cvtColor(np.asarray(p.convert("RGB")), cv2.COLOR_RGB2BGR) for p in photos
+    ]
+    kept = [i for i, bgr in enumerate(photo_bgr) if _sharpness(bgr) >= min_sharpness]
     key_feats = [
         _color_histogram(Image.fromarray(small_frames[i][:, :, ::-1])) for i in selected
     ]
-    photo_feats = [_color_histogram(photo) for photo in photos]
+    photo_feats = [_color_histogram(photos[i]) for i in kept]
     photo_after = _assign_photos_to_keyframes(photo_feats, key_feats)
+
+    # Photos prêtes : auto-luminosité (si sombre) + letterbox + flou de mouvement.
+    stills = [
+        _motion_blur_bgr(
+            _letterbox_bgr(
+                Image.fromarray(
+                    cv2.cvtColor(_auto_brightness_bgr(photo_bgr[i]), cv2.COLOR_BGR2RGB)
+                ),
+                width,
+                height,
+            )
+        )
+        for i in kept
+    ]
 
     # Passe 2 : relit la vidéo et ne conserve que les keyframes (plein format).
     cap = cv2.VideoCapture(str(video_path))
@@ -326,20 +406,30 @@ def _build_mix_video(
     if not writer.isOpened():
         raise WorldLabsError("Impossible d'initialiser l'encodeur MP4 (codec mp4v).")
 
-    # Photos pré-floutées une seule fois (letterbox + flou de mouvement léger).
-    blurred = [_motion_blur_bgr(_letterbox_bgr(photo, width, height)) for photo in photos]
-
+    key_hold = max(1, round(MIX_KEYFRAME_SECONDS * fps))
+    still_hold = max(1, round(still_seconds * fps))
+    placed = sum(len(v) for v in photo_after.values())
+    total_writes = len(keyframes) * key_hold + placed * still_hold
+    pbar = (
+        tqdm(total=total_writes, desc="Encodage MP4 mix", unit="frame")
+        if tqdm is not None
+        else None
+    )
     try:
-        key_hold = max(1, round(MIX_KEYFRAME_SECONDS * fps))
-        still_hold = max(1, round(still_seconds * fps))
         for pos, keyframe in enumerate(keyframes):
             for _ in range(key_hold):
                 writer.write(keyframe)
+            if pbar is not None:
+                pbar.update(key_hold)
             for p_idx in photo_after.get(pos, []):
                 for _ in range(still_hold):
-                    writer.write(blurred[p_idx])
+                    writer.write(stills[p_idx])
+                if pbar is not None:
+                    pbar.update(still_hold)
     finally:
         writer.release()
+        if pbar is not None:
+            pbar.close()
 
     return dest
 
@@ -350,23 +440,36 @@ def _build_mix_video(
 
 
 def _request_json(url: str, *, api_key: str, method: str = "GET", payload: dict | None = None) -> dict:
-    """Appel JSON minimal vers l'API World Labs (header WLT-Api-Key)."""
+    """Appel JSON minimal vers l'API World Labs (header WLT-Api-Key).
+
+    Les erreurs serveur transitoires (``WORLD_LABS_RETRY_STATUSES``, p. ex. 500 /
+    503) sont retentées jusqu'à ``WORLD_LABS_MAX_RETRIES`` fois, avec
+    ``WORLD_LABS_RETRY_DELAY`` secondes d'attente entre chaque tentative.
+    """
     data = None
     headers = {"WLT-Api-Key": api_key}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:500]
-        raise WorldLabsError(
-            f"World Labs {method} a échoué ({exc.code}) : {detail}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise WorldLabsError(f"World Labs injoignable : {exc}") from exc
+
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code in WORLD_LABS_RETRY_STATUSES and attempt < WORLD_LABS_MAX_RETRIES:
+                attempt += 1
+                time.sleep(WORLD_LABS_RETRY_DELAY)
+                continue
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            raise WorldLabsError(
+                f"World Labs {method} a échoué ({exc.code}) : {detail}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise WorldLabsError(f"World Labs injoignable : {exc}") from exc
     try:
         return json.loads(body) if body else {}
     except json.JSONDecodeError:
@@ -700,6 +803,7 @@ def forge(
     mix: bool = False,
     still_seconds: float = DEFAULT_STILL_SECONDS,
     frames: int = DEFAULT_MIX_FRAMES,
+    min_sharpness: float = DEFAULT_MIN_SHARPNESS,
     seed: int = DEFAULT_SEED,
     num_inference_steps: int = DEFAULT_STEPS,
     min_images: int = MIN_IMAGES,
@@ -736,6 +840,8 @@ def forge(
             vidéo (aucune limite de 4 images).
         still_seconds: durée d'affichage de chaque photo dans le MP4 mix.
         frames: nombre de keyframes vidéo gardés pour le MP4 mix.
+        min_sharpness: seuil de netteté (Laplacien) sous lequel photos et frames
+            sont écartées du MP4 mix.
     """
     out = Path(output_dir) / (run_id or _run_id())
     out.mkdir(parents=True, exist_ok=True)
@@ -760,6 +866,7 @@ def forge(
             out / "mixed.mp4",
             still_seconds=still_seconds,
             max_frames=frames,
+            min_sharpness=min_sharpness,
         )
 
         manifest = {
@@ -770,6 +877,7 @@ def forge(
             "photos": len(photo_images),
             "still_seconds": still_seconds,
             "frames": frames,
+            "min_sharpness": min_sharpness,
             "mixed_video": str(mixed_path),
             "prompt": None,
         }
@@ -950,6 +1058,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Nombre de keyframes vidéo gardés pour le MP4 mix (par défaut : {DEFAULT_MIX_FRAMES}).",
     )
     parser.add_argument(
+        "--min-sharpness",
+        dest="min_sharpness",
+        type=float,
+        default=DEFAULT_MIN_SHARPNESS,
+        help=f"Seuil de netteté (Laplacien) sous lequel photos/frames sont écartées du mix (par défaut : {DEFAULT_MIN_SHARPNESS}).",
+    )
+    parser.add_argument(
         "-s",
         "--seed",
         type=int,
@@ -998,6 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
             mix=args.mix,
             still_seconds=args.still_seconds,
             frames=args.frames,
+            min_sharpness=args.min_sharpness,
             seed=args.seed,
             num_inference_steps=args.num_inference_steps,
             min_images=args.min_images,

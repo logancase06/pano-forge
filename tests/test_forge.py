@@ -20,12 +20,15 @@ from src.forge import (
     PipelineResult,
     WorldLabsError,
     _assign_photos_to_keyframes,
+    _auto_brightness_bgr,
     _build_video_request,
     _build_world_request,
     _motion_blur_bgr,
     _operation_id,
+    _request_json,
     _select_images,
     _select_motion_frames,
+    _sharpness,
     download_world_assets,
     forge,
     submit_world_labs,
@@ -322,10 +325,11 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
     def fake_ingest(input_dir, *, min_images=3):
         return [FakeImg(100, 100, "p1.jpg"), FakeImg(100, 100, "p2.jpg")]
 
-    def fake_build(video_path, photos, dest, *, still_seconds=5.0, max_frames=50):
+    def fake_build(video_path, photos, dest, *, still_seconds=5.0, max_frames=50, min_sharpness=50.0):
         captured["photos"] = len(photos)
         captured["still"] = still_seconds
         captured["max_frames"] = max_frames
+        captured["min_sharpness"] = min_sharpness
         Path(dest).write_bytes(b"mp4")
         return Path(dest)
 
@@ -341,7 +345,7 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
 
     result = forge(
         tmp_path / "input", tmp_path / "out",
-        mix=True, video=vid, still_seconds=3.0, frames=30, submit=True,
+        mix=True, video=vid, still_seconds=3.0, frames=30, min_sharpness=75.0, submit=True,
     )
 
     assert result.backend == "mix"
@@ -352,10 +356,12 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
     assert captured["photos"] == 2  # les 2 photos ajoutées
     assert captured["still"] == 3.0
     assert captured["max_frames"] == 30  # --frames transmis à la construction
+    assert captured["min_sharpness"] == 75.0  # --min-sharpness transmis
     assert result.world_labs_request["backend"] == "mix"
     assert result.world_labs_request["photos"] == 2
     assert result.world_labs_request["still_seconds"] == 3.0
     assert result.world_labs_request["frames"] == 30
+    assert result.world_labs_request["min_sharpness"] == 75.0
 
 
 def test_forge_mix_requires_video(tmp_path):
@@ -373,7 +379,7 @@ def test_forge_mix_tolerates_no_photos(tmp_path, monkeypatch):
     def boom_ingest(*a, **k):
         raise IngestError("aucune photo")
 
-    def fake_build(video_path, photos, dest, *, still_seconds=5.0, max_frames=50):
+    def fake_build(video_path, photos, dest, *, still_seconds=5.0, max_frames=50, min_sharpness=50.0):
         captured["photos"] = len(photos)
         Path(dest).write_bytes(b"mp4")
         return Path(dest)
@@ -390,17 +396,18 @@ def test_build_mix_video_keeps_motion_frames_and_interleaves(tmp_path):
     cv2 = pytest.importorskip("cv2")
     import numpy as np
 
+    rng = np.random.default_rng(0)
     src = tmp_path / "src.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(src), fourcc, 10.0, (32, 32))
+    writer = cv2.VideoWriter(str(src), fourcc, 10.0, (48, 48))
     if not writer.isOpened():
         pytest.skip("encodeur mp4v indisponible")
-    # 10 frames, niveaux de gris croissants : chaque frame diffère de la précédente.
-    for i in range(10):
-        writer.write(np.full((32, 32, 3), i * 25, dtype=np.uint8))
+    # Bruit aléatoire par frame : fort mouvement ET forte netteté (Laplacien élevé).
+    for _ in range(10):
+        writer.write(rng.integers(0, 256, (48, 48, 3), dtype=np.uint8))
     writer.release()
 
-    photos = [Image.new("RGB", (20, 16), (255, 0, 0))]
+    photos = [Image.fromarray(rng.integers(0, 256, (32, 24, 3), dtype=np.uint8))]
     out = forge_module._build_mix_video(
         src, photos, tmp_path / "mixed.mp4", still_seconds=0.5, max_frames=3
     )
@@ -412,7 +419,28 @@ def test_build_mix_video_keeps_motion_frames_and_interleaves(tmp_path):
     cap.release()
 
 
-# --- mix : détection de mouvement / intercalage / flou ----------------------
+def test_build_mix_video_falls_back_when_all_blurry(tmp_path):
+    # Frames/photo uniformes (netteté nulle) : le garde-fou évite un MP4 vide.
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    src = tmp_path / "src.mp4"
+    writer = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (32, 32))
+    if not writer.isOpened():
+        pytest.skip("encodeur mp4v indisponible")
+    for i in range(5):
+        writer.write(np.full((32, 32, 3), i * 20, dtype=np.uint8))
+    writer.release()
+
+    out = forge_module._build_mix_video(
+        src, [], tmp_path / "mixed.mp4", still_seconds=0.5, max_frames=3
+    )
+    cap = cv2.VideoCapture(str(out))
+    assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) > 0  # frames gardées malgré le flou
+    cap.release()
+
+
+# --- mix : détection de mouvement / intercalage / flou / netteté / luminosité --
 
 
 def test_select_motion_frames_keeps_top_movers_in_order():
@@ -424,6 +452,38 @@ def test_select_motion_frames_keeps_top_movers_in_order():
 def test_select_motion_frames_caps_to_available():
     assert _select_motion_frames([0.0, 1.0], 50) == [0, 1]
     assert _select_motion_frames([], 50) == []
+
+
+def test_select_motion_frames_restricts_to_eligible():
+    # Même si la frame 2 bouge le plus, elle est exclue si pas dans `eligible`.
+    scores = [0.0, 1.0, 9.0, 2.0, 8.0]
+    assert _select_motion_frames(scores, 2, eligible=[0, 3, 4]) == [3, 4]
+
+
+def test_sharpness_higher_for_edges_than_flat():
+    pytest.importorskip("cv2")
+    import numpy as np
+
+    flat = np.full((40, 40, 3), 120, dtype=np.uint8)
+    edged = flat.copy()
+    edged[:, 20:] = 255  # bord net
+    assert _sharpness(edged) > _sharpness(flat)
+    assert _sharpness(flat) == 0.0
+
+
+def test_auto_brightness_lifts_dark_image_only():
+    pytest.importorskip("cv2")
+    import numpy as np
+
+    # Image sombre (luma ~30) : doit être éclaircie.
+    dark = np.full((32, 32, 3), 30, dtype=np.uint8)
+    dark[:16] = 20  # un peu de variation pour que equalizeHist agisse
+    lifted = _auto_brightness_bgr(dark)
+    assert forge_module._mean_luma(lifted) > forge_module._mean_luma(dark)
+
+    # Image déjà claire (luma ~200) : inchangée (au-dessus du seuil).
+    bright = np.full((32, 32, 3), 200, dtype=np.uint8)
+    assert np.array_equal(_auto_brightness_bgr(bright), bright)
 
 
 def test_assign_photos_to_keyframes_picks_most_similar():
@@ -528,6 +588,76 @@ def test_submit_world_labs_propagates_error(tmp_path):
     op = {"operation_id": "o", "done": True, "error": "bad input"}
     with pytest.raises(WorldLabsError, match="échou"):
         submit_world_labs(pano, api_key="k", poll_interval=0, _transport=lambda *a, **k: op)
+
+
+# --- World Labs : retry sur erreurs serveur transitoires (500/503) -----------
+
+
+class _FakeResp:
+    def __init__(self, body=b"{}"):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _http_error(url, code, body=b"boom"):
+    import io
+    import urllib.error
+
+    return urllib.error.HTTPError(url, code, "err", {}, io.BytesIO(body))
+
+
+def test_request_json_retries_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_urlopen(req):
+        calls["n"] += 1
+        if calls["n"] <= 2:  # deux 500 transitoires, puis succès (cas vécu)
+            raise _http_error(req.full_url, 500)
+        return _FakeResp(b'{"ok": true}')
+
+    monkeypatch.setattr(forge_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(forge_module.time, "sleep", lambda s: None)
+
+    assert _request_json("http://x", api_key="k") == {"ok": True}
+    assert calls["n"] == 3  # 2 échecs + 1 succès
+
+
+def test_request_json_gives_up_after_max_retries(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_urlopen(req):
+        calls["n"] += 1
+        raise _http_error(req.full_url, 503)  # 503 persistant
+
+    monkeypatch.setattr(forge_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(forge_module.time, "sleep", lambda s: None)
+
+    with pytest.raises(WorldLabsError, match="503"):
+        _request_json("http://x", api_key="k")
+    assert calls["n"] == forge_module.WORLD_LABS_MAX_RETRIES + 1  # 1 essai + 3 retries
+
+
+def test_request_json_no_retry_on_client_error(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_urlopen(req):
+        calls["n"] += 1
+        raise _http_error(req.full_url, 400, b"bad request")
+
+    monkeypatch.setattr(forge_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(forge_module.time, "sleep", lambda s: None)
+
+    with pytest.raises(WorldLabsError, match="400"):
+        _request_json("http://x", api_key="k")
+    assert calls["n"] == 1  # 4xx : pas de retry
 
 
 # --- téléchargement des assets ----------------------------------------------

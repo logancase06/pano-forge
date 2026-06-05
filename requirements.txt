@@ -14,6 +14,9 @@ gradio_client>=1.3.0
 # (lazy-imported; only needed for --mix)
 opencv-python-headless>=4.8.0
 
+# Progress bar during --mix MP4 encoding (lazy-imported; only needed for --mix)
+tqdm>=4.66.0
+
 # Local DiT360 backend (optional, GPU/CUDA) — uncomment to run the model locally
 # diffusers>=0.30.0
 # torch>=2.2.0
