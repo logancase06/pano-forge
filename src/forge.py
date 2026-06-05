@@ -66,6 +66,12 @@ DEFAULT_BACKEND = BACKEND_WORLDLABS
 # Bord long max des photos envoyées (orientation EXIF déjà corrigée par ingest).
 MAX_SOURCE_EDGE = 2048
 
+# Mode --mix : durée d'une photo fixe, nombre de keyframes vidéo gardées, et
+# durée d'affichage d'un keyframe (court montage des angles les plus distincts).
+DEFAULT_STILL_SECONDS = 5.0
+DEFAULT_MIX_FRAMES = 50
+MIX_KEYFRAME_SECONDS = 0.2
+
 
 class WorldLabsError(Exception):
     """Erreur levée lors d'un échec d'appel à l'API World Labs."""
@@ -184,17 +190,76 @@ def _letterbox_bgr(pil_image: Image.Image, width: int, height: int) -> np.ndarra
     return canvas[:, :, ::-1].copy()  # RGB -> BGR, contigu
 
 
+def _select_motion_frames(scores: list[float], max_frames: int) -> list[int]:
+    """Indices des frames au plus fort changement visuel, en ordre temporel.
+
+    ``scores[i]`` = différence inter-frame de la frame ``i`` (mouvement caméra).
+    On garde les ``max_frames`` plus mouvementées — les **vrais nouveaux angles**
+    — puis on les remet en ordre chronologique pour un montage cohérent.
+    """
+    n = len(scores)
+    if n == 0:
+        return []
+    keep = min(max_frames, n)
+    top = sorted(range(n), key=lambda i: (scores[i], i), reverse=True)[:keep]
+    return sorted(top)
+
+
+def _assign_photos_to_keyframes(
+    photo_feats: list[np.ndarray], key_feats: list[np.ndarray]
+) -> dict[int, list[int]]:
+    """Place chaque photo après le keyframe le plus similaire (distance L1).
+
+    Retourne ``{position_keyframe: [indices_photos]}`` : chaque photo est insérée
+    au moment le plus pertinent de la timeline plutôt qu'à la fin.
+    """
+    assignments: dict[int, list[int]] = {}
+    if not key_feats:
+        return assignments
+    for p_idx, pf in enumerate(photo_feats):
+        dists = [float(np.abs(pf - kf).sum()) for kf in key_feats]
+        best = int(np.argmin(dists))
+        assignments.setdefault(best, []).append(p_idx)
+    return assignments
+
+
+def _motion_blur_bgr(image: np.ndarray, *, kernel_size: int | None = None) -> np.ndarray:
+    """Léger flou de mouvement horizontal : rapproche une photo fixe d'une frame.
+
+    World Labs intègre mieux des stills qui ressemblent à des frames vidéo
+    naturelles (légèrement filées) qu'à des images parfaitement nettes. Noyau
+    linéaire horizontal, taille proportionnelle au petit côté (donc « léger »).
+    """
+    import cv2
+
+    h, w = image.shape[:2]
+    if kernel_size is None:
+        kernel_size = max(3, round(min(w, h) / 120))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = np.zeros((kernel_size, kernel_size), dtype=np.float64)
+    kernel[kernel_size // 2, :] = 1.0 / kernel_size
+    return cv2.filter2D(image, -1, kernel)
+
+
 def _build_mix_video(
     video_path: str | Path,
     photos: list[Image.Image],
     dest: str | Path,
     *,
-    still_seconds: float = 2.5,
+    still_seconds: float = DEFAULT_STILL_SECONDS,
+    max_frames: int = DEFAULT_MIX_FRAMES,
 ) -> Path:
-    """Assemble un MP4 : vidéo originale + chaque photo en frame fixe.
+    """Assemble un MP4 : keyframes vidéo mouvementés + photos intercalées.
 
-    Chaque photo est tenue ~``still_seconds`` secondes (letterbox au format de la
-    vidéo). Import paresseux d'``cv2`` (requis seulement pour ``--mix``).
+    1. **Détection de mouvement** : les frames consécutives sont comparées et on
+       ne garde que les ``max_frames`` au plus fort changement visuel (les vrais
+       nouveaux angles), en ordre chronologique.
+    2. **Intercalage intelligent** : chaque photo (légèrement floutée pour
+       ressembler à une frame vidéo) est insérée après le keyframe le plus
+       similaire et tenue ~``still_seconds`` secondes.
+
+    Import paresseux d'``cv2`` (requis seulement pour ``--mix``).
     """
     try:
         import cv2
@@ -214,30 +279,67 @@ def _build_mix_video(
         cap.release()
         raise WorldLabsError(f"Vidéo illisible : {video_path}")
 
+    # Passe 1 : descripteurs légers (64x64) de chaque frame + score de mouvement.
+    small_frames: list[np.ndarray] = []  # BGR réduit, pour la similarité photos
+    scores: list[float] = []
+    prev_gray = None
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        small = cv2.resize(frame, (64, 64))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        scores.append(0.0 if prev_gray is None else float(cv2.absdiff(gray, prev_gray).mean()))
+        prev_gray = gray
+        small_frames.append(small)
+    cap.release()
+    if not small_frames:
+        raise WorldLabsError(f"Vidéo sans frames lisibles : {video_path}")
+
+    selected = _select_motion_frames(scores, max_frames)
+
+    # Intercalage : keyframe le plus proche de chaque photo (histogrammes couleur).
+    key_feats = [
+        _color_histogram(Image.fromarray(small_frames[i][:, :, ::-1])) for i in selected
+    ]
+    photo_feats = [_color_histogram(photo) for photo in photos]
+    photo_after = _assign_photos_to_keyframes(photo_feats, key_feats)
+
+    # Passe 2 : relit la vidéo et ne conserve que les keyframes (plein format).
+    cap = cv2.VideoCapture(str(video_path))
+    selected_set = set(selected)
+    keyframes: list[np.ndarray] = []
+    idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if idx in selected_set:
+            keyframes.append(frame)  # ordre chronologique == ordre de `selected`
+        idx += 1
+    cap.release()
+
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(dest), fourcc, fps, (width, height))
     if not writer.isOpened():
-        cap.release()
         raise WorldLabsError("Impossible d'initialiser l'encodeur MP4 (codec mp4v).")
 
+    # Photos pré-floutées une seule fois (letterbox + flou de mouvement léger).
+    blurred = [_motion_blur_bgr(_letterbox_bgr(photo, width, height)) for photo in photos]
+
     try:
-        # 1) recopie la vidéo originale image par image
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            writer.write(frame)
-        # 2) ajoute chaque photo comme frame fixe pendant ~still_seconds
-        hold = max(1, round(still_seconds * fps))
-        for photo in photos:
-            bgr = _letterbox_bgr(photo, width, height)
-            for _ in range(hold):
-                writer.write(bgr)
+        key_hold = max(1, round(MIX_KEYFRAME_SECONDS * fps))
+        still_hold = max(1, round(still_seconds * fps))
+        for pos, keyframe in enumerate(keyframes):
+            for _ in range(key_hold):
+                writer.write(keyframe)
+            for p_idx in photo_after.get(pos, []):
+                for _ in range(still_hold):
+                    writer.write(blurred[p_idx])
     finally:
         writer.release()
-        cap.release()
 
     return dest
 
@@ -596,7 +698,8 @@ def forge(
     multi: bool = False,
     video: str | Path | None = None,
     mix: bool = False,
-    still_seconds: float = 2.5,
+    still_seconds: float = DEFAULT_STILL_SECONDS,
+    frames: int = DEFAULT_MIX_FRAMES,
     seed: int = DEFAULT_SEED,
     num_inference_steps: int = DEFAULT_STEPS,
     min_images: int = MIN_IMAGES,
@@ -627,10 +730,12 @@ def forge(
         extra_guidance: consignes de style pour la caption (backend dit360).
         hf_token: token HF optionnel pour la caption (backend dit360).
         run_id: nom du sous-dossier de run (par défaut : horodatage).
-        mix: assemble un MP4 combiné (vidéo ``video`` + chaque photo de
-            ``input_dir`` en frame fixe ~``still_seconds`` s) et l'envoie à
-            World Labs en mode vidéo (aucune limite de 4 images).
+        mix: assemble un MP4 combiné (les ``frames`` keyframes les plus
+            mouvementés de ``video`` + chaque photo de ``input_dir`` floutée et
+            intercalée ~``still_seconds`` s) et l'envoie à World Labs en mode
+            vidéo (aucune limite de 4 images).
         still_seconds: durée d'affichage de chaque photo dans le MP4 mix.
+        frames: nombre de keyframes vidéo gardés pour le MP4 mix.
     """
     out = Path(output_dir) / (run_id or _run_id())
     out.mkdir(parents=True, exist_ok=True)
@@ -650,7 +755,11 @@ def forge(
         photo_images = [im.image for im in photos]
 
         mixed_path = _build_mix_video(
-            video_path, photo_images, out / "mixed.mp4", still_seconds=still_seconds
+            video_path,
+            photo_images,
+            out / "mixed.mp4",
+            still_seconds=still_seconds,
+            max_frames=frames,
         )
 
         manifest = {
@@ -660,6 +769,7 @@ def forge(
             "video": str(video_path),
             "photos": len(photo_images),
             "still_seconds": still_seconds,
+            "frames": frames,
             "mixed_video": str(mixed_path),
             "prompt": None,
         }
@@ -830,8 +940,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--still-seconds",
         dest="still_seconds",
         type=float,
-        default=2.5,
-        help="Durée d'affichage de chaque photo dans le MP4 mix (par défaut : 2.5 s).",
+        default=DEFAULT_STILL_SECONDS,
+        help=f"Durée d'affichage de chaque photo dans le MP4 mix (par défaut : {DEFAULT_STILL_SECONDS} s).",
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=DEFAULT_MIX_FRAMES,
+        help=f"Nombre de keyframes vidéo gardés pour le MP4 mix (par défaut : {DEFAULT_MIX_FRAMES}).",
     )
     parser.add_argument(
         "-s",
@@ -881,6 +997,7 @@ def main(argv: list[str] | None = None) -> int:
             video=args.video,
             mix=args.mix,
             still_seconds=args.still_seconds,
+            frames=args.frames,
             seed=args.seed,
             num_inference_steps=args.num_inference_steps,
             min_images=args.min_images,

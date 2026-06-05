@@ -19,10 +19,13 @@ from src.forge import (
     WORLD_LABS_MODEL,
     PipelineResult,
     WorldLabsError,
+    _assign_photos_to_keyframes,
     _build_video_request,
     _build_world_request,
+    _motion_blur_bgr,
     _operation_id,
     _select_images,
+    _select_motion_frames,
     download_world_assets,
     forge,
     submit_world_labs,
@@ -319,9 +322,10 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
     def fake_ingest(input_dir, *, min_images=3):
         return [FakeImg(100, 100, "p1.jpg"), FakeImg(100, 100, "p2.jpg")]
 
-    def fake_build(video_path, photos, dest, *, still_seconds=2.5):
+    def fake_build(video_path, photos, dest, *, still_seconds=5.0, max_frames=50):
         captured["photos"] = len(photos)
         captured["still"] = still_seconds
+        captured["max_frames"] = max_frames
         Path(dest).write_bytes(b"mp4")
         return Path(dest)
 
@@ -337,7 +341,7 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
 
     result = forge(
         tmp_path / "input", tmp_path / "out",
-        mix=True, video=vid, still_seconds=3.0, submit=True,
+        mix=True, video=vid, still_seconds=3.0, frames=30, submit=True,
     )
 
     assert result.backend == "mix"
@@ -347,9 +351,11 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
     assert "multi" not in captured or captured["multi"] is False
     assert captured["photos"] == 2  # les 2 photos ajoutées
     assert captured["still"] == 3.0
+    assert captured["max_frames"] == 30  # --frames transmis à la construction
     assert result.world_labs_request["backend"] == "mix"
     assert result.world_labs_request["photos"] == 2
     assert result.world_labs_request["still_seconds"] == 3.0
+    assert result.world_labs_request["frames"] == 30
 
 
 def test_forge_mix_requires_video(tmp_path):
@@ -367,7 +373,7 @@ def test_forge_mix_tolerates_no_photos(tmp_path, monkeypatch):
     def boom_ingest(*a, **k):
         raise IngestError("aucune photo")
 
-    def fake_build(video_path, photos, dest, *, still_seconds=2.5):
+    def fake_build(video_path, photos, dest, *, still_seconds=5.0, max_frames=50):
         captured["photos"] = len(photos)
         Path(dest).write_bytes(b"mp4")
         return Path(dest)
@@ -380,7 +386,7 @@ def test_forge_mix_tolerates_no_photos(tmp_path, monkeypatch):
     assert captured["photos"] == 0  # aucune photo -> juste la vidéo
 
 
-def test_build_mix_video_appends_stills(tmp_path):
+def test_build_mix_video_keeps_motion_frames_and_interleaves(tmp_path):
     cv2 = pytest.importorskip("cv2")
     import numpy as np
 
@@ -389,13 +395,62 @@ def test_build_mix_video_appends_stills(tmp_path):
     writer = cv2.VideoWriter(str(src), fourcc, 10.0, (32, 32))
     if not writer.isOpened():
         pytest.skip("encodeur mp4v indisponible")
-    for _ in range(5):
-        writer.write(np.zeros((32, 32, 3), dtype=np.uint8))
+    # 10 frames, niveaux de gris croissants : chaque frame diffère de la précédente.
+    for i in range(10):
+        writer.write(np.full((32, 32, 3), i * 25, dtype=np.uint8))
     writer.release()
 
     photos = [Image.new("RGB", (20, 16), (255, 0, 0))]
-    out = forge_module._build_mix_video(src, photos, tmp_path / "mixed.mp4", still_seconds=0.5)
+    out = forge_module._build_mix_video(
+        src, photos, tmp_path / "mixed.mp4", still_seconds=0.5, max_frames=3
+    )
     assert out.exists() and out.stat().st_size > 0
+
+    # Le mix relit bien une vidéo valide (keyframes + photo intercalée).
+    cap = cv2.VideoCapture(str(out))
+    assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) > 0
+    cap.release()
+
+
+# --- mix : détection de mouvement / intercalage / flou ----------------------
+
+
+def test_select_motion_frames_keeps_top_movers_in_order():
+    # scores : la frame 2 et 4 bougent le plus ; on garde 2 keyframes, en ordre.
+    scores = [0.0, 1.0, 9.0, 2.0, 8.0]
+    assert _select_motion_frames(scores, 2) == [2, 4]
+
+
+def test_select_motion_frames_caps_to_available():
+    assert _select_motion_frames([0.0, 1.0], 50) == [0, 1]
+    assert _select_motion_frames([], 50) == []
+
+
+def test_assign_photos_to_keyframes_picks_most_similar():
+    import numpy as np
+
+    key_feats = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+    photo_feats = [np.array([0.9, 0.1]), np.array([0.1, 0.9])]
+    assert _assign_photos_to_keyframes(photo_feats, key_feats) == {0: [0], 1: [1]}
+
+
+def test_assign_photos_to_keyframes_empty_keyframes():
+    import numpy as np
+
+    assert _assign_photos_to_keyframes([np.array([1.0])], []) == {}
+
+
+def test_motion_blur_preserves_shape_and_softens():
+    pytest.importorskip("cv2")
+    import numpy as np
+
+    img = np.zeros((40, 40, 3), dtype=np.uint8)
+    img[:, 20:] = 255  # bord net vertical
+    blurred = _motion_blur_bgr(img)
+    assert blurred.shape == img.shape
+    # Le flou horizontal crée des valeurs intermédiaires à la frontière nette.
+    assert blurred[:, 18:22].std() > 0
+    assert not np.array_equal(blurred, img)
 
 
 def test_operation_id_extracts_last_segment():

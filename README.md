@@ -4,7 +4,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.11-blue.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Tests](https://img.shields.io/badge/tests-66%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-71%20passing-brightgreen.svg)
 
 pano-forge transforme de vraies photos d'intérieur (ou une vidéo de marche dans
 la pièce) en un **monde 3D explorable** — mesh, panorama équirectangulaire et
@@ -73,13 +73,23 @@ python -m src.forge --video input/walkthrough.mp4 --submit
 ```
 
 ### 4. Mix vidéo + photos — `--mix`
-Assemble **un seul MP4** (la vidéo, puis chaque photo tenue ~2.5 s en frame
-fixe) et l'envoie en mode `video` — aucune limite de 4 images : World Labs voit
-la vidéo **et** toutes les photos.
+Assemble **un seul MP4** intelligent et l'envoie en mode `video` — aucune limite
+de 4 images : World Labs voit la vidéo **et** toutes les photos. Le montage est
+optimisé sur 4 points :
+
+1. **Détection de mouvement** : au lieu de recopier la vidéo entière, on ne garde
+   que les `--frames` keyframes au plus fort changement visuel (différence
+   inter-frame), pour capturer les vrais nouveaux angles.
+2. **Intercalage intelligent** : chaque photo est insérée après le keyframe le
+   plus similaire (histogrammes couleur), au moment pertinent de la timeline
+   plutôt qu'à la fin.
+3. **Photos tenues ~5 s** chacune (`--still-seconds`).
+4. **Léger flou de mouvement** sur les photos fixes pour qu'elles ressemblent à
+   des frames vidéo naturelles — mieux intégrées par World Labs.
 
 ```bash
 python -m src.forge --video input/walkthrough.mp4 --mix --submit
-# durée par photo : --still-seconds 3
+# durée par photo : --still-seconds 6 ; keyframes gardés : --frames 80
 ```
 
 ### Backend alternatif — `--backend dit360`
@@ -98,8 +108,9 @@ python -m src.forge input/ --backend dit360 --submit
 | `--submit` | Lance réellement la génération World Labs (payant). |
 | `--multi` | Multi-image (4 photos les plus diversifiées). |
 | `--video PATH` | Entrée vidéo. |
-| `--mix` | MP4 combiné vidéo + photos (avec `--video`). |
-| `--still-seconds N` | Durée de chaque photo dans le MP4 mix (défaut 2.5). |
+| `--mix` | MP4 combiné keyframes vidéo + photos intercalées (avec `--video`). |
+| `--still-seconds N` | Durée de chaque photo dans le MP4 mix (défaut 5). |
+| `--frames N` | Keyframes vidéo gardés pour le MP4 mix (défaut 50). |
 | `-m, --min-images N` | Nombre minimal de photos requis (défaut 3). |
 | `--backend {worldlabs,dit360}` | Choix du backend (défaut `worldlabs`). |
 
