@@ -4,7 +4,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.11-blue.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Tests](https://img.shields.io/badge/tests-78%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-88%20passing-brightgreen.svg)
 
 pano-forge transforme de vraies photos d'intérieur (ou une vidéo de marche dans
 la pièce) en un **monde 3D explorable** — mesh, panorama équirectangulaire et
@@ -90,12 +90,28 @@ optimisé :
    coller à la luminosité des frames vidéo.
 6. **Filtre de netteté** : photos et frames trop floues (score Laplacien
    `< --min-sharpness`, défaut 50) sont écartées automatiquement.
+7. **Zones immobiles** : les frames où la caméra était arrêtée (mouvement
+   `< --min-motion`, défaut 5.0) sont retirées.
+8. **Upscale** : les photos sous 720p sont agrandies (cv2 INTER_LANCZOS4) avant
+   insertion.
+9. **Transitions douces** : `--transition-frames` (défaut 8) frames de fondu
+   enchaîné autour de chaque photo.
 
-Une **barre de progression** (tqdm) s'affiche pendant l'encodage du MP4.
+**Robustesse** : la vidéo est validée avant traitement (format mp4/mov/mkv,
+résolution ≥ 480p, durée 3–300 s), les vidéos **verticales** sont redressées
+selon leurs métadonnées de rotation, et les frames extraites sont **mises en
+cache** (hash MD5) sous `output/.cache/` pour ré-exécution instantanée. Le MP4
+combiné est encodé en **H.264** (repli mp4v/XVID), **sans piste audio**,
+multi-threadé, avec une **barre de progression** (tqdm).
+
+Chaque run écrit un **`run.log.json`** structuré (durée de chaque étape, frames
+extraites/retenues, taille du MP4, netteté moyenne, résultat World Labs, et
+métriques du thumbnail : netteté, luminosité, contraste, ratio de zones floues).
 
 ```bash
 python -m src.forge --video input/walkthrough.mp4 --mix --submit
-# durée par photo : --still-seconds 6 ; keyframes : --frames 80 ; netteté min : --min-sharpness 80
+# durée par photo : --still-seconds 6 ; keyframes : --frames 80 ;
+# netteté min : --min-sharpness 80 ; mouvement min : --min-motion 8 ; fondu : --transition-frames 12
 ```
 
 ### Backend alternatif — `--backend dit360`
@@ -118,6 +134,8 @@ python -m src.forge input/ --backend dit360 --submit
 | `--still-seconds N` | Durée de chaque photo dans le MP4 mix (défaut 5). |
 | `--frames N` | Keyframes vidéo gardés pour le MP4 mix (défaut 50). |
 | `--min-sharpness N` | Seuil de netteté ; photos/frames plus floues sont écartées du mix (défaut 50). |
+| `--min-motion N` | Seuil de mouvement ; frames immobiles écartées du mix (défaut 5.0). |
+| `--transition-frames N` | Frames de fondu enchaîné autour des photos (défaut 8). |
 | `-m, --min-images N` | Nombre minimal de photos requis (défaut 3). |
 | `--backend {worldlabs,dit360}` | Choix du backend (défaut `worldlabs`). |
 

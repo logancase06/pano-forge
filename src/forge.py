@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -78,6 +80,27 @@ MIX_KEYFRAME_SECONDS = 0.2
 DEFAULT_MIN_SHARPNESS = 50.0
 DARK_LUMA_THRESHOLD = 100.0
 
+# --mix : seuil de mouvement (différence inter-frame) sous lequel une frame est
+# jugée immobile (caméra arrêtée) et écartée ; nombre de frames de fondu enchaîné
+# entre clips ; côté court minimum d'une photo avant upscale LANCZOS4.
+DEFAULT_MIN_MOTION = 5.0
+DEFAULT_TRANSITION_FRAMES = 8
+MIN_PHOTO_SHORT_SIDE = 720
+
+# Codecs d'encodage du MP4 mix, du plus compact (H.264) au plus compatible. On
+# garde le premier dont le VideoWriter s'ouvre réellement.
+MIX_CODECS = ("avc1", "H264", "mp4v", "XVID")
+
+# Validation vidéo (--mix) : formats acceptés, résolution et durée admissibles.
+SUPPORTED_VIDEO_EXTS = (".mp4", ".mov", ".mkv")
+MIN_VIDEO_SHORT_SIDE = 480
+MIN_VIDEO_SECONDS = 3.0
+MAX_VIDEO_SECONDS = 300.0
+
+# Métriques thumbnail : variance de Laplacien par bloc sous laquelle un bloc est
+# jugé flou (pour le ratio de zones floues).
+THUMBNAIL_BLUR_BLOCK_THRESHOLD = 100.0
+
 # Retry World Labs : un 500/503 transitoire est retenté quelques fois avant abandon.
 WORLD_LABS_RETRY_STATUSES = (500, 503)
 WORLD_LABS_MAX_RETRIES = 3
@@ -86,6 +109,10 @@ WORLD_LABS_RETRY_DELAY = 10.0
 
 class WorldLabsError(Exception):
     """Erreur levée lors d'un échec d'appel à l'API World Labs."""
+
+
+class VideoValidationError(Exception):
+    """Vidéo refusée par la validation (format, résolution ou durée invalide)."""
 
 
 @dataclass
@@ -189,16 +216,44 @@ def _even_azimuth(index: int, count: int) -> int:
     return round(index * 360 / count) if count else 0
 
 
-def _letterbox_bgr(pil_image: Image.Image, width: int, height: int) -> np.ndarray:
-    """Redimensionne une image PIL dans un canvas WxH (letterbox), en BGR pour cv2."""
-    img = pil_image if pil_image.mode == "RGB" else pil_image.convert("RGB")
-    scale = min(width / img.width, height / img.height)
-    nw, nh = max(1, round(img.width * scale)), max(1, round(img.height * scale))
-    resized = np.asarray(img.resize((nw, nh), Image.LANCZOS))  # RGB
-    canvas = np.zeros((height, width, 3), dtype=np.uint8)  # bandes noires
+def _upscale_if_low_res(
+    image_bgr: np.ndarray, *, min_side: int = MIN_PHOTO_SHORT_SIDE
+) -> np.ndarray:
+    """Upscale (cv2 INTER_LANCZOS4) une image dont le côté court est sous ``min_side``.
+
+    Les photos basse résolution sont agrandies avant insertion pour coller à la
+    résolution vidéo (LANCZOS4 = interpolation de meilleure qualité d'OpenCV).
+    """
+    import cv2
+
+    h, w = image_bgr.shape[:2]
+    short = min(h, w)
+    if short >= min_side:
+        return image_bgr
+    scale = min_side / short
+    return cv2.resize(
+        image_bgr,
+        (max(1, round(w * scale)), max(1, round(h * scale))),
+        interpolation=cv2.INTER_LANCZOS4,
+    )
+
+
+def _letterbox_bgr(image_bgr: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Insère une image BGR dans un canvas WxH (letterbox, bandes noires).
+
+    Agrandit (LANCZOS4) ou réduit (INTER_AREA) selon le facteur d'échelle.
+    """
+    import cv2
+
+    h0, w0 = image_bgr.shape[:2]
+    scale = min(width / w0, height / h0)
+    nw, nh = max(1, round(w0 * scale)), max(1, round(h0 * scale))
+    interp = cv2.INTER_LANCZOS4 if scale > 1 else cv2.INTER_AREA
+    resized = cv2.resize(image_bgr, (nw, nh), interpolation=interp)
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
     x, y = (width - nw) // 2, (height - nh) // 2
     canvas[y : y + nh, x : x + nw] = resized
-    return canvas[:, :, ::-1].copy()  # RGB -> BGR, contigu
+    return canvas
 
 
 def _sharpness(image_bgr: np.ndarray) -> float:
@@ -289,6 +344,234 @@ def _motion_blur_bgr(image: np.ndarray, *, kernel_size: int | None = None) -> np
     return cv2.filter2D(image, -1, kernel)
 
 
+# ---------------------------------------------------------------------------
+# Vidéo : validation, orientation, extraction (avec cache) et encodage
+# ---------------------------------------------------------------------------
+
+
+def _video_rotation(cap) -> int:
+    """Rotation (0/90/180/270°) déclarée dans les métadonnées de la vidéo.
+
+    Lit ``CAP_PROP_ORIENTATION_META`` (rotation track / EXIF vidéo). Renvoie 0 si
+    indisponible ou non standard.
+    """
+    import cv2
+
+    try:
+        rot = int(round(cap.get(cv2.CAP_PROP_ORIENTATION_META)))
+    except (AttributeError, ValueError, TypeError):  # pragma: no cover
+        return 0
+    rot %= 360
+    return rot if rot in (90, 180, 270) else 0
+
+
+def _rotate_bgr(frame: np.ndarray, degrees: int) -> np.ndarray:
+    """Applique une rotation de 0/90/180/270° à une frame BGR."""
+    import cv2
+
+    if degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if degrees == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
+def validate_video(path: str | Path) -> dict:
+    """Valide une vidéo avant traitement ; lève ``VideoValidationError`` sinon.
+
+    Contrôles : extension (mp4/mov/mkv), lisibilité, résolution (côté court
+    ≥ 480p, après prise en compte de la rotation) et durée (entre 3 s et 300 s).
+    Retourne les métadonnées de base (fps, frame_count, dimensions, durée).
+    """
+    import cv2
+
+    path = Path(path)
+    ext = path.suffix.lower()
+    if ext not in SUPPORTED_VIDEO_EXTS:
+        raise VideoValidationError(
+            f"Format vidéo non supporté : {ext or '(aucune extension)'} "
+            f"(attendu : {', '.join(SUPPORTED_VIDEO_EXTS)})."
+        )
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        cap.release()
+        raise VideoValidationError(f"Vidéo illisible ou codec non supporté : {path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    rotation = _video_rotation(cap)
+    cap.release()
+
+    if rotation in (90, 270):
+        width, height = height, width
+    if min(width, height) < MIN_VIDEO_SHORT_SIDE:
+        raise VideoValidationError(
+            f"Résolution trop basse ({width}x{height}) ; "
+            f"minimum {MIN_VIDEO_SHORT_SIDE}p."
+        )
+    if fps <= 0 or count <= 0:
+        raise VideoValidationError(
+            "Durée indéterminable (fps ou nombre de frames manquant)."
+        )
+    duration = count / fps
+    if not (MIN_VIDEO_SECONDS <= duration <= MAX_VIDEO_SECONDS):
+        raise VideoValidationError(
+            f"Durée {duration:.1f}s hors bornes "
+            f"[{MIN_VIDEO_SECONDS:.0f}, {MAX_VIDEO_SECONDS:.0f}]s."
+        )
+    return {
+        "fps": fps,
+        "frame_count": int(count),
+        "width": width,
+        "height": height,
+        "duration": duration,
+        "rotation": rotation,
+    }
+
+
+def _video_file_hash(path: str | Path) -> str:
+    """Hash MD5 du fichier vidéo (clé de cache des frames extraites)."""
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _frame_path(frames_dir: Path, index: int) -> Path:
+    return frames_dir / f"frame_{index:06d}.jpg"
+
+
+def _extract_frames(video_path: str | Path, frames_dir: str | Path) -> dict:
+    """Extrait les frames (rotation corrigée) vers ``frames_dir``, avec cache.
+
+    Si ``frames_dir`` contient déjà un ``meta.json`` cohérent, les frames sont
+    réutilisées telles quelles (cache hit). Sinon la vidéo est décodée : chaque
+    frame est redressée selon la rotation, sauvegardée en JPEG, et les scores de
+    mouvement (différence inter-frame) et de netteté (Laplacien) sont calculés.
+    """
+    import cv2
+
+    frames_dir = Path(frames_dir)
+    meta_path = frames_dir / "meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            meta = None
+        if meta and meta.get("count") and _frame_path(frames_dir, meta["count"] - 1).exists():
+            return meta  # cache hit : frames déjà extraites pour ce hash
+
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if fps <= 0:
+        fps = 30.0
+    # Désactive l'auto-rotation d'OpenCV pour appliquer la rotation nous-mêmes.
+    try:
+        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+    except (AttributeError, cv2.error):  # pragma: no cover
+        pass
+    rotation = _video_rotation(cap)
+
+    scores: list[float] = []
+    sharp: list[float] = []
+    prev_gray = None
+    count = 0
+    width = height = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = _rotate_bgr(frame, rotation)
+        height, width = frame.shape[:2]
+        gray = cv2.cvtColor(cv2.resize(frame, (64, 64)), cv2.COLOR_BGR2GRAY)
+        scores.append(0.0 if prev_gray is None else float(cv2.absdiff(gray, prev_gray).mean()))
+        sharp.append(_sharpness(frame))
+        prev_gray = gray
+        cv2.imwrite(str(_frame_path(frames_dir, count)), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        count += 1
+    cap.release()
+    if count == 0:
+        raise WorldLabsError(f"Vidéo sans frames lisibles : {video_path}")
+
+    meta = {
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "count": count,
+        "rotation": rotation,
+        "scores": scores,
+        "sharpness": sharp,
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    return meta
+
+
+def _open_video_writer(dest: Path, fps: float, width: int, height: int):
+    """Ouvre un ``VideoWriter`` avec le premier codec disponible (H.264 d'abord).
+
+    Retourne ``(writer, codec_name)``. Lève ``WorldLabsError`` si aucun codec ne
+    s'initialise.
+    """
+    import cv2
+
+    for name in MIX_CODECS:
+        writer = cv2.VideoWriter(
+            str(dest), cv2.VideoWriter_fourcc(*name), fps, (width, height)
+        )
+        if writer.isOpened():
+            return writer, name
+        writer.release()
+    raise WorldLabsError(
+        "Impossible d'initialiser l'encodeur MP4 (aucun codec disponible)."
+    )
+
+
+def _prepare_still_bgr(image_bgr: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Prépare une photo pour le MP4 : auto-luminosité, upscale, letterbox, flou."""
+    corrected = _auto_brightness_bgr(image_bgr)
+    upscaled = _upscale_if_low_res(corrected)
+    boxed = _letterbox_bgr(upscaled, width, height)
+    return _motion_blur_bgr(boxed)
+
+
+def _image_quality_metrics(path: str | Path) -> dict:
+    """Métriques de qualité d'une image : netteté, luminosité, contraste, flou.
+
+    - **sharpness** : variance globale du Laplacien.
+    - **brightness** : luminance moyenne (0-255).
+    - **contrast** : écart-type des niveaux de gris.
+    - **blur_ratio** : fraction de blocs (grille 8x8) dont la variance de
+      Laplacien est sous ``THUMBNAIL_BLUR_BLOCK_THRESHOLD``.
+    """
+    import cv2
+
+    arr = np.asarray(Image.open(path).convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    h, w = gray.shape
+    bh, bw = max(1, h // 8), max(1, w // 8)
+    total = blurry = 0
+    for y in range(0, h, bh):
+        for x in range(0, w, bw):
+            block = lap[y : y + bh, x : x + bw]
+            if block.size == 0:
+                continue
+            total += 1
+            if float(block.var()) < THUMBNAIL_BLUR_BLOCK_THRESHOLD:
+                blurry += 1
+    return {
+        "sharpness": float(lap.var()),
+        "brightness": float(gray.mean()),
+        "contrast": float(gray.std()),
+        "blur_ratio": (blurry / total) if total else 0.0,
+    }
+
+
 def _build_mix_video(
     video_path: str | Path,
     photos: list[Image.Image],
@@ -297,19 +580,25 @@ def _build_mix_video(
     still_seconds: float = DEFAULT_STILL_SECONDS,
     max_frames: int = DEFAULT_MIX_FRAMES,
     min_sharpness: float = DEFAULT_MIN_SHARPNESS,
+    min_motion: float = DEFAULT_MIN_MOTION,
+    transition_frames: int = DEFAULT_TRANSITION_FRAMES,
+    cache_dir: str | Path | None = None,
+    stats: dict | None = None,
 ) -> Path:
-    """Assemble un MP4 : keyframes vidéo mouvementés + photos intercalées.
+    """Assemble un MP4 (sans audio) : keyframes vidéo mouvementés + photos.
 
-    1. **Détection de mouvement** : les frames consécutives sont comparées et on
-       ne garde que les ``max_frames`` au plus fort changement visuel (les vrais
-       nouveaux angles), en ordre chronologique.
-    2. **Intercalage intelligent** : chaque photo est insérée après le keyframe
-       le plus similaire et tenue ~``still_seconds`` secondes.
-    3. **Netteté** : photos et frames dont la netteté (Laplacien) est sous
-       ``min_sharpness`` sont écartées (garde-fou : si toutes les frames sont
-       écartées, on retombe sur l'ensemble complet pour ne pas vider la vidéo).
-    4. **Luminosité / flou** : les photos sombres sont ré-égalisées puis
-       légèrement floutées pour ressembler à des frames vidéo naturelles.
+    1. **Extraction + cache** : les frames sont décodées (rotation corrigée) et
+       mises en cache par hash MD5 sous ``cache_dir`` ; une vidéo resoumise est
+       relue depuis le cache.
+    2. **Zones immobiles** : les frames dont le mouvement est sous ``min_motion``
+       (caméra arrêtée) sont écartées.
+    3. **Mouvement + netteté** : parmi les frames mouvementées et nettes
+       (Laplacien ≥ ``min_sharpness``), on garde les ``max_frames`` au plus fort
+       changement visuel (garde-fou : repli sur toutes les frames si vide).
+    4. **Photos** : photos floues écartées, sombres ré-égalisées, basse
+       résolution upscalées (LANCZOS4), letterbox, léger flou de mouvement.
+    5. **Transitions** : ``transition_frames`` frames de fondu enchaîné autour de
+       chaque photo. Encodage H.264 (repli mp4v/XVID), multi-threadé.
 
     Imports paresseux d'``cv2`` / ``tqdm`` (requis seulement pour ``--mix``).
     """
@@ -325,111 +614,115 @@ def _build_mix_video(
     except ImportError:  # pragma: no cover - tqdm optionnel
         tqdm = None
 
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-    if fps <= 0:
-        fps = 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if width <= 0 or height <= 0:
-        cap.release()
-        raise WorldLabsError(f"Vidéo illisible : {video_path}")
+    cv2.setNumThreads(max(1, os.cpu_count() or 1))  # encodage/filtrage multi-threadé
 
-    # Passe 1 : descripteur léger (64x64), score de mouvement et netteté par frame.
-    small_frames: list[np.ndarray] = []  # BGR réduit, pour la similarité photos
-    scores: list[float] = []
-    sharp: list[float] = []
-    prev_gray = None
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        small = cv2.resize(frame, (64, 64))
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        scores.append(0.0 if prev_gray is None else float(cv2.absdiff(gray, prev_gray).mean()))
-        sharp.append(_sharpness(frame))
-        prev_gray = gray
-        small_frames.append(small)
-    cap.release()
-    if not small_frames:
-        raise WorldLabsError(f"Vidéo sans frames lisibles : {video_path}")
+    # Cache persistant (hash MD5) si cache_dir fourni, sinon dossier temporaire.
+    tmp_dir = None
+    if cache_dir is not None:
+        frames_dir = Path(cache_dir) / _video_file_hash(video_path)
+    else:
+        tmp_dir = tempfile.mkdtemp(prefix="panoforge-frames-")
+        frames_dir = Path(tmp_dir)
 
-    # Écarte les frames floues ; garde-fou si plus rien ne passe le seuil.
-    eligible = [i for i in range(len(scores)) if sharp[i] >= min_sharpness]
-    if not eligible:
-        eligible = list(range(len(scores)))
-    selected = _select_motion_frames(scores, max_frames, eligible=eligible)
-
-    # Écarte les photos floues, puis intercale par similarité (histogrammes).
-    photo_bgr = [
-        cv2.cvtColor(np.asarray(p.convert("RGB")), cv2.COLOR_RGB2BGR) for p in photos
-    ]
-    kept = [i for i, bgr in enumerate(photo_bgr) if _sharpness(bgr) >= min_sharpness]
-    key_feats = [
-        _color_histogram(Image.fromarray(small_frames[i][:, :, ::-1])) for i in selected
-    ]
-    photo_feats = [_color_histogram(photos[i]) for i in kept]
-    photo_after = _assign_photos_to_keyframes(photo_feats, key_feats)
-
-    # Photos prêtes : auto-luminosité (si sombre) + letterbox + flou de mouvement.
-    stills = [
-        _motion_blur_bgr(
-            _letterbox_bgr(
-                Image.fromarray(
-                    cv2.cvtColor(_auto_brightness_bgr(photo_bgr[i]), cv2.COLOR_BGR2RGB)
-                ),
-                width,
-                height,
-            )
-        )
-        for i in kept
-    ]
-
-    # Passe 2 : relit la vidéo et ne conserve que les keyframes (plein format).
-    cap = cv2.VideoCapture(str(video_path))
-    selected_set = set(selected)
-    keyframes: list[np.ndarray] = []
-    idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if idx in selected_set:
-            keyframes.append(frame)  # ordre chronologique == ordre de `selected`
-        idx += 1
-    cap.release()
-
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(dest), fourcc, fps, (width, height))
-    if not writer.isOpened():
-        raise WorldLabsError("Impossible d'initialiser l'encodeur MP4 (codec mp4v).")
-
-    key_hold = max(1, round(MIX_KEYFRAME_SECONDS * fps))
-    still_hold = max(1, round(still_seconds * fps))
-    placed = sum(len(v) for v in photo_after.values())
-    total_writes = len(keyframes) * key_hold + placed * still_hold
-    pbar = (
-        tqdm(total=total_writes, desc="Encodage MP4 mix", unit="frame")
-        if tqdm is not None
-        else None
-    )
     try:
+        meta = _extract_frames(video_path, frames_dir)
+        fps = meta["fps"]
+        width, height, count = meta["width"], meta["height"], meta["count"]
+        scores, sharp = meta["scores"], meta["sharpness"]
+
+        # Écarte frames immobiles (mouvement faible) et floues ; garde-fou si vide.
+        eligible = [
+            i
+            for i in range(count)
+            if scores[i] >= min_motion and sharp[i] >= min_sharpness
+        ]
+        if not eligible:
+            eligible = list(range(count))
+        selected = _select_motion_frames(scores, max_frames, eligible=eligible)
+        keyframes = [cv2.imread(str(_frame_path(frames_dir, i))) for i in selected]
+
+        # Photos : écarte les floues, intercale par similarité, prépare les stills.
+        photo_bgr = [
+            cv2.cvtColor(np.asarray(p.convert("RGB")), cv2.COLOR_RGB2BGR) for p in photos
+        ]
+        kept = [i for i, bgr in enumerate(photo_bgr) if _sharpness(bgr) >= min_sharpness]
+        key_feats = [
+            _color_histogram(Image.fromarray(cv2.cvtColor(kf, cv2.COLOR_BGR2RGB)))
+            for kf in keyframes
+        ]
+        photo_feats = [_color_histogram(photos[i]) for i in kept]
+        photo_after = _assign_photos_to_keyframes(photo_feats, key_feats)
+        stills = [_prepare_still_bgr(photo_bgr[i], width, height) for i in kept]
+
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        writer, codec = _open_video_writer(dest, fps, width, height)
+
+        key_hold = max(1, round(MIX_KEYFRAME_SECONDS * fps))
+        still_hold = max(1, round(still_seconds * fps))
+
+        # Clips ordonnés : (image, durée, est_une_photo).
+        clips: list[tuple[np.ndarray, int, bool]] = []
         for pos, keyframe in enumerate(keyframes):
-            for _ in range(key_hold):
-                writer.write(keyframe)
-            if pbar is not None:
-                pbar.update(key_hold)
+            clips.append((keyframe, key_hold, False))
             for p_idx in photo_after.get(pos, []):
-                for _ in range(still_hold):
-                    writer.write(stills[p_idx])
+                clips.append((stills[p_idx], still_hold, True))
+
+        # Fondu uniquement aux frontières impliquant une photo (montage net sinon).
+        def _needs_fade(i: int) -> bool:
+            return transition_frames > 0 and (clips[i][2] or clips[i - 1][2])
+
+        total = sum(hold for _, hold, _ in clips)
+        total += sum(transition_frames for i in range(1, len(clips)) if _needs_fade(i))
+
+        pbar = (
+            tqdm(total=total, desc="Encodage MP4 mix", unit="frame")
+            if tqdm is not None
+            else None
+        )
+        try:
+            for i, (img, hold, _is_photo) in enumerate(clips):
+                if i > 0 and _needs_fade(i):
+                    prev_img = clips[i - 1][0]
+                    for step in range(1, transition_frames + 1):
+                        alpha = step / (transition_frames + 1)
+                        writer.write(
+                            cv2.addWeighted(prev_img, 1.0 - alpha, img, alpha, 0.0)
+                        )
+                    if pbar is not None:
+                        pbar.update(transition_frames)
+                for _ in range(hold):
+                    writer.write(img)
                 if pbar is not None:
-                    pbar.update(still_hold)
+                    pbar.update(hold)
+        finally:
+            writer.release()
+            if pbar is not None:
+                pbar.close()
+
+        if stats is not None:
+            sel_sharp = [sharp[i] for i in selected]
+            stats.update(
+                {
+                    "frames_extracted": count,
+                    "frames_retained": len(keyframes),
+                    "photos_total": len(photos),
+                    "photos_kept": len(kept),
+                    "mean_sharpness": float(np.mean(sel_sharp)) if sel_sharp else 0.0,
+                    "codec": codec,
+                    "audio": False,
+                    "transition_frames": transition_frames,
+                    "min_motion": min_motion,
+                    "fps": fps,
+                    "resolution": [width, height],
+                    "rotation": meta["rotation"],
+                    "mp4_bytes": dest.stat().st_size if dest.exists() else 0,
+                    "cached": cache_dir is not None,
+                }
+            )
     finally:
-        writer.release()
-        if pbar is not None:
-            pbar.close()
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return dest
 
@@ -793,6 +1086,41 @@ def _run_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _world_status(world: dict | None, submit: bool) -> dict:
+    """Résumé du résultat World Labs pour le log structuré."""
+    if not submit:
+        return {"status": "not_submitted"}
+    if not world:
+        return {"status": "no_response"}
+    return {"status": "done", "assets": sorted((world.get("assets") or {}).keys())}
+
+
+def _write_run_log(out: Path, run_log: dict) -> None:
+    """Écrit le log structuré JSON du run (métriques + résultat)."""
+    (out / "run.log.json").write_text(
+        json.dumps(run_log, indent=2), encoding="utf-8"
+    )
+
+
+def _record_thumbnail_metrics(world_assets: dict | None, run_log: dict) -> None:
+    """Calcule et logge les métriques qualité du thumbnail téléchargé, si présent.
+
+    Les erreurs de calcul (image illisible, etc.) sont avalées : elles ne doivent
+    jamais faire échouer un run par ailleurs réussi.
+    """
+    thumb = (world_assets or {}).get("thumbnail")
+    if not thumb or not Path(thumb).exists():
+        return
+    t0 = time.perf_counter()
+    try:
+        run_log["thumbnail"] = _image_quality_metrics(thumb)
+    except Exception as exc:  # pragma: no cover - dépend de l'asset distant
+        run_log["thumbnail"] = {"error": str(exc)}
+    run_log.setdefault("steps", {})["thumbnail_metrics"] = round(
+        time.perf_counter() - t0, 4
+    )
+
+
 def forge(
     input_dir: str | Path,
     output_dir: str | Path = "output",
@@ -804,6 +1132,8 @@ def forge(
     still_seconds: float = DEFAULT_STILL_SECONDS,
     frames: int = DEFAULT_MIX_FRAMES,
     min_sharpness: float = DEFAULT_MIN_SHARPNESS,
+    min_motion: float = DEFAULT_MIN_MOTION,
+    transition_frames: int = DEFAULT_TRANSITION_FRAMES,
     seed: int = DEFAULT_SEED,
     num_inference_steps: int = DEFAULT_STEPS,
     min_images: int = MIN_IMAGES,
@@ -842,6 +1172,9 @@ def forge(
         frames: nombre de keyframes vidéo gardés pour le MP4 mix.
         min_sharpness: seuil de netteté (Laplacien) sous lequel photos et frames
             sont écartées du MP4 mix.
+        min_motion: seuil de mouvement (différence inter-frame) sous lequel une
+            frame est jugée immobile et écartée du MP4 mix.
+        transition_frames: nombre de frames de fondu enchaîné autour des photos.
     """
     out = Path(output_dir) / (run_id or _run_id())
     out.mkdir(parents=True, exist_ok=True)
@@ -854,12 +1187,20 @@ def forge(
         if not video_path.exists():
             raise WorldLabsError(f"Vidéo introuvable : {video_path}")
 
+        run_log: dict = {"run_id": out.name, "backend": "mix", "video": str(video_path), "steps": {}}
+
+        t0 = time.perf_counter()
+        validate_video(video_path)
+        run_log["steps"]["validate"] = round(time.perf_counter() - t0, 4)
+
         try:
             photos = list(ingest(input_dir, min_images=1))
         except IngestError:
             photos = []  # mix tolère l'absence de photos (vidéo seule)
         photo_images = [im.image for im in photos]
 
+        mix_stats: dict = {}
+        t0 = time.perf_counter()
         mixed_path = _build_mix_video(
             video_path,
             photo_images,
@@ -867,7 +1208,13 @@ def forge(
             still_seconds=still_seconds,
             max_frames=frames,
             min_sharpness=min_sharpness,
+            min_motion=min_motion,
+            transition_frames=transition_frames,
+            cache_dir=Path(output_dir) / ".cache",
+            stats=mix_stats,
         )
+        run_log["steps"]["build_mix"] = round(time.perf_counter() - t0, 4)
+        run_log["mix"] = mix_stats
 
         manifest = {
             "endpoint": WORLD_LABS_ENDPOINT,
@@ -878,6 +1225,8 @@ def forge(
             "still_seconds": still_seconds,
             "frames": frames,
             "min_sharpness": min_sharpness,
+            "min_motion": min_motion,
+            "transition_frames": transition_frames,
             "mixed_video": str(mixed_path),
             "prompt": None,
         }
@@ -888,10 +1237,17 @@ def forge(
         world = None
         world_assets = None
         if submit:
+            t0 = time.perf_counter()
             world = submit_world_labs(
                 video=mixed_path, display_name=out.name or "pano-forge"
             )
+            run_log["steps"]["submit"] = round(time.perf_counter() - t0, 4)
+            t0 = time.perf_counter()
             world_assets = download_world_assets(world, out)
+            run_log["steps"]["download"] = round(time.perf_counter() - t0, 4)
+        run_log["world"] = _world_status(world, submit)
+        _record_thumbnail_metrics(world_assets, run_log)
+        _write_run_log(out, run_log)
         return PipelineResult(
             backend="mix",
             source_images=[mixed_path],
@@ -908,6 +1264,7 @@ def forge(
         video_path = Path(video)
         if not video_path.exists():
             raise WorldLabsError(f"Vidéo introuvable : {video_path}")
+        run_log = {"run_id": out.name, "backend": "video", "video": str(video_path), "steps": {}}
         manifest = {
             "endpoint": WORLD_LABS_ENDPOINT,
             "model": WORLD_LABS_MODEL,
@@ -921,10 +1278,17 @@ def forge(
         world = None
         world_assets = None
         if submit:
+            t0 = time.perf_counter()
             world = submit_world_labs(
                 video=video_path, display_name=out.name or "pano-forge"
             )
+            run_log["steps"]["submit"] = round(time.perf_counter() - t0, 4)
+            t0 = time.perf_counter()
             world_assets = download_world_assets(world, out)
+            run_log["steps"]["download"] = round(time.perf_counter() - t0, 4)
+        run_log["world"] = _world_status(world, submit)
+        _record_thumbnail_metrics(world_assets, run_log)
+        _write_run_log(out, run_log)
         return PipelineResult(
             backend="video",
             source_images=[video_path],
@@ -942,6 +1306,7 @@ def forge(
             f"Choisis {BACKEND_WORLDLABS!r} ou {BACKEND_DIT360!r}."
         )
 
+    run_log = {"run_id": out.name, "backend": backend, "steps": {}}
     images = ingest(input_dir, min_images=min_images)
 
     prompt: str | None = None
@@ -979,18 +1344,26 @@ def forge(
     (out / "world_labs_request.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
+    run_log["source_images"] = len(source_images)
 
     world = None
     world_assets = None
     if submit:
         submit_arg = items if use_multi else items[0][0]
+        t0 = time.perf_counter()
         world = submit_world_labs(
             submit_arg,
             prompt=prompt,
             display_name=out.name or "pano-forge",
             multi=use_multi,
         )
+        run_log["steps"]["submit"] = round(time.perf_counter() - t0, 4)
+        t0 = time.perf_counter()
         world_assets = download_world_assets(world, out)
+        run_log["steps"]["download"] = round(time.perf_counter() - t0, 4)
+    run_log["world"] = _world_status(world, submit)
+    _record_thumbnail_metrics(world_assets, run_log)
+    _write_run_log(out, run_log)
 
     return PipelineResult(
         backend=backend,
@@ -1065,6 +1438,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Seuil de netteté (Laplacien) sous lequel photos/frames sont écartées du mix (par défaut : {DEFAULT_MIN_SHARPNESS}).",
     )
     parser.add_argument(
+        "--min-motion",
+        dest="min_motion",
+        type=float,
+        default=DEFAULT_MIN_MOTION,
+        help=f"Seuil de mouvement sous lequel une frame immobile est écartée du mix (par défaut : {DEFAULT_MIN_MOTION}).",
+    )
+    parser.add_argument(
+        "--transition-frames",
+        dest="transition_frames",
+        type=int,
+        default=DEFAULT_TRANSITION_FRAMES,
+        help=f"Frames de fondu enchaîné autour des photos dans le MP4 mix (par défaut : {DEFAULT_TRANSITION_FRAMES}).",
+    )
+    parser.add_argument(
         "-s",
         "--seed",
         type=int,
@@ -1114,12 +1501,21 @@ def main(argv: list[str] | None = None) -> int:
             still_seconds=args.still_seconds,
             frames=args.frames,
             min_sharpness=args.min_sharpness,
+            min_motion=args.min_motion,
+            transition_frames=args.transition_frames,
             seed=args.seed,
             num_inference_steps=args.num_inference_steps,
             min_images=args.min_images,
             submit=args.submit,
         )
-    except (IngestError, CaptionError, PanoramaError, WorldLabsError, ValueError) as exc:
+    except (
+        IngestError,
+        CaptionError,
+        PanoramaError,
+        WorldLabsError,
+        VideoValidationError,
+        ValueError,
+    ) as exc:
         print(f"[forge] Erreur : {exc}")
         return 1
 

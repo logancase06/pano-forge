@@ -15,6 +15,7 @@ from PIL import Image
 
 from src import forge as forge_module
 from src.forge import (
+    MIX_CODECS,
     MULTI_IMAGE_LIMIT,
     WORLD_LABS_MODEL,
     PipelineResult,
@@ -23,12 +24,17 @@ from src.forge import (
     _auto_brightness_bgr,
     _build_video_request,
     _build_world_request,
+    _image_quality_metrics,
     _motion_blur_bgr,
+    _open_video_writer,
     _operation_id,
     _request_json,
+    _rotate_bgr,
     _select_images,
     _select_motion_frames,
     _sharpness,
+    _upscale_if_low_res,
+    _world_status,
     download_world_assets,
     forge,
     submit_world_labs,
@@ -325,11 +331,19 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
     def fake_ingest(input_dir, *, min_images=3):
         return [FakeImg(100, 100, "p1.jpg"), FakeImg(100, 100, "p2.jpg")]
 
-    def fake_build(video_path, photos, dest, *, still_seconds=5.0, max_frames=50, min_sharpness=50.0):
+    def fake_build(
+        video_path, photos, dest, *, still_seconds=5.0, max_frames=50,
+        min_sharpness=50.0, min_motion=5.0, transition_frames=8, cache_dir=None, stats=None,
+    ):
         captured["photos"] = len(photos)
         captured["still"] = still_seconds
         captured["max_frames"] = max_frames
         captured["min_sharpness"] = min_sharpness
+        captured["min_motion"] = min_motion
+        captured["transition_frames"] = transition_frames
+        captured["cache_dir"] = cache_dir
+        if stats is not None:
+            stats.update({"frames_extracted": 5, "frames_retained": 3, "mp4_bytes": 3})
         Path(dest).write_bytes(b"mp4")
         return Path(dest)
 
@@ -339,13 +353,15 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
         return {"assets": {}}
 
     monkeypatch.setattr(forge_module, "ingest", fake_ingest)
+    monkeypatch.setattr(forge_module, "validate_video", lambda p: {"duration": 10.0})
     monkeypatch.setattr(forge_module, "_build_mix_video", fake_build)
     monkeypatch.setattr(forge_module, "submit_world_labs", fake_submit)
     monkeypatch.setattr(forge_module, "download_world_assets", lambda w, o: {})
 
     result = forge(
         tmp_path / "input", tmp_path / "out",
-        mix=True, video=vid, still_seconds=3.0, frames=30, min_sharpness=75.0, submit=True,
+        mix=True, video=vid, still_seconds=3.0, frames=30, min_sharpness=75.0,
+        min_motion=8.0, transition_frames=4, submit=True,
     )
 
     assert result.backend == "mix"
@@ -357,11 +373,20 @@ def test_forge_mix_builds_combined_video_and_submits(tmp_path, monkeypatch):
     assert captured["still"] == 3.0
     assert captured["max_frames"] == 30  # --frames transmis à la construction
     assert captured["min_sharpness"] == 75.0  # --min-sharpness transmis
+    assert captured["min_motion"] == 8.0  # --min-motion transmis
+    assert captured["transition_frames"] == 4  # --transition-frames transmis
+    assert captured["cache_dir"] == tmp_path / "out" / ".cache"  # cache partagé
     assert result.world_labs_request["backend"] == "mix"
     assert result.world_labs_request["photos"] == 2
     assert result.world_labs_request["still_seconds"] == 3.0
     assert result.world_labs_request["frames"] == 30
     assert result.world_labs_request["min_sharpness"] == 75.0
+    # log structuré : métriques du build_mix + résultat World Labs
+    run_log = json.loads((result.run_dir / "run.log.json").read_text(encoding="utf-8"))
+    assert run_log["backend"] == "mix"
+    assert run_log["mix"]["frames_extracted"] == 5
+    assert "build_mix" in run_log["steps"] and "validate" in run_log["steps"]
+    assert run_log["world"]["status"] == "done"
 
 
 def test_forge_mix_requires_video(tmp_path):
@@ -379,12 +404,16 @@ def test_forge_mix_tolerates_no_photos(tmp_path, monkeypatch):
     def boom_ingest(*a, **k):
         raise IngestError("aucune photo")
 
-    def fake_build(video_path, photos, dest, *, still_seconds=5.0, max_frames=50, min_sharpness=50.0):
+    def fake_build(
+        video_path, photos, dest, *, still_seconds=5.0, max_frames=50,
+        min_sharpness=50.0, min_motion=5.0, transition_frames=8, cache_dir=None, stats=None,
+    ):
         captured["photos"] = len(photos)
         Path(dest).write_bytes(b"mp4")
         return Path(dest)
 
     monkeypatch.setattr(forge_module, "ingest", boom_ingest)
+    monkeypatch.setattr(forge_module, "validate_video", lambda p: {"duration": 10.0})
     monkeypatch.setattr(forge_module, "_build_mix_video", fake_build)
 
     result = forge(tmp_path / "input", tmp_path / "out", mix=True, video=vid)
@@ -484,6 +513,77 @@ def test_auto_brightness_lifts_dark_image_only():
     # Image déjà claire (luma ~200) : inchangée (au-dessus du seuil).
     bright = np.full((32, 32, 3), 200, dtype=np.uint8)
     assert np.array_equal(_auto_brightness_bgr(bright), bright)
+
+
+def test_upscale_if_low_res_only_upscales_small():
+    pytest.importorskip("cv2")
+    import numpy as np
+
+    small = np.zeros((240, 320, 3), dtype=np.uint8)  # côté court 240 < 720
+    up = _upscale_if_low_res(small)
+    assert min(up.shape[:2]) >= 720
+
+    big = np.zeros((1080, 1920, 3), dtype=np.uint8)  # déjà >= 720 : inchangé
+    assert _upscale_if_low_res(big).shape == big.shape
+
+
+def test_rotate_bgr_swaps_dimensions_for_90():
+    pytest.importorskip("cv2")
+    import numpy as np
+
+    frame = np.zeros((40, 60, 3), dtype=np.uint8)  # h=40, w=60
+    assert _rotate_bgr(frame, 90).shape[:2] == (60, 40)
+    assert _rotate_bgr(frame, 180).shape[:2] == (40, 60)
+    assert _rotate_bgr(frame, 0).shape[:2] == (40, 60)
+
+
+def test_open_video_writer_picks_available_codec(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+
+    dest = tmp_path / "out.mp4"
+    writer, codec = _open_video_writer(dest, 10.0, 64, 64)
+    try:
+        assert codec in MIX_CODECS
+        assert writer.isOpened()
+    finally:
+        writer.release()
+
+
+def test_image_quality_metrics_distinguishes_sharp_and_blurry(tmp_path):
+    pytest.importorskip("cv2")
+    import numpy as np
+    from PIL import ImageFilter
+
+    rng = np.random.default_rng(0)
+    sharp_img = Image.fromarray(rng.integers(0, 256, (128, 128, 3), dtype=np.uint8))
+    sharp_img.save(tmp_path / "sharp.png")
+    blurry_img = sharp_img.filter(ImageFilter.GaussianBlur(6))
+    blurry_img.save(tmp_path / "blurry.png")
+
+    sharp = _image_quality_metrics(tmp_path / "sharp.png")
+    blurry = _image_quality_metrics(tmp_path / "blurry.png")
+
+    assert set(sharp) == {"sharpness", "brightness", "contrast", "blur_ratio"}
+    assert sharp["sharpness"] > blurry["sharpness"]
+    assert blurry["blur_ratio"] >= sharp["blur_ratio"]
+    assert 0.0 <= sharp["blur_ratio"] <= 1.0
+
+
+def test_world_status_reports_states():
+    assert _world_status(None, submit=False) == {"status": "not_submitted"}
+    assert _world_status(None, submit=True) == {"status": "no_response"}
+    status = _world_status({"assets": {"glb": 1, "pano": 2}}, submit=True)
+    assert status["status"] == "done"
+    assert status["assets"] == ["glb", "pano"]
+
+
+def test_forge_worldlabs_writes_run_log(tmp_path, patched):
+    # Même sans --submit, un run.log.json structuré est écrit.
+    result = forge(tmp_path / "input", tmp_path / "out")
+    run_log = json.loads((result.run_dir / "run.log.json").read_text(encoding="utf-8"))
+    assert run_log["backend"] == "worldlabs"
+    assert run_log["world"]["status"] == "not_submitted"
+    assert run_log["source_images"] == 1
 
 
 def test_assign_photos_to_keyframes_picks_most_similar():
